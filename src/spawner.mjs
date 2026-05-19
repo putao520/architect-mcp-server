@@ -86,11 +86,11 @@ ${LSP_DAP_GUIDE}
 输出格式：调用图 + 数据流图 + 关键发现。`,
 };
 
-async function retryWithBackoff(fn, maxRetries = 3) {
+async function retryWithBackoff(fn, maxRetries = 100) {
   for (let i = 0; i <= maxRetries; i++) {
     try { return await fn(); } catch (err) {
-      if (i < maxRetries && /503|no available account/i.test(err.message || '')) {
-        const delay = Math.pow(2, i) * 1000;
+      if (i < maxRetries && /503|500|no available|Internal Server Error|socket connection/i.test(err.message || '')) {
+        const delay = Math.min(Math.pow(2, i) * 1000, 60000);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
