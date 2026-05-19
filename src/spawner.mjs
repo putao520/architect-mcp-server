@@ -162,7 +162,7 @@ export function registerTools(server, env) {
   const tools = [
     {
       name: 'architect_consult',
-      description: '架构咨询。比你自己分析强：生成独立子 CC，拥有完整 agentic loop（读文件 + LSP 语义分析 + DAP 运行时验证 + WebSearch），独立完成深度分析后返回结构化建议。适用场景：架构选型、设计决策、技术方案对比、可行性评估。遇到"这个架构行不行""选 A 还是 B""怎么设计这个系统"类问题时，用这个工具比自己脑补可靠得多。',
+      description: '选型/方案/设计/可行性分析 — 别自己拍脑袋。生成独立子 CC（Opus 4.7 + 1M 上下文 + max effort），用 LSP 语义读代码 + WebSearch 查技术背景 + DAP 验证运行时，返回结构化建议（问题分析→现状评估→方案对比→实施路径）。触发场景：用户问"选 A 还是 B""这个架构行不行""怎么设计""技术方案推荐""要不要引入 XX 库""对比 XX 和 YY"。你手工做这种事最多看 3 个文件就下结论，它跑 3000 轮深入全代码库，结果可靠一个量级。',
       schema: {
         prompt: { type: 'string', describe: '架构问题或设计决策描述' },
         cwd: { type: 'string', optional: true, describe: '项目工作目录（默认当前目录）' },
@@ -177,7 +177,7 @@ export function registerTools(server, env) {
     },
     {
       name: 'architect_audit',
-      description: 'SPEC 审计。比自己读 SPEC 检查强：生成独立子 CC，自动提取 SPEC 结构（标题层级/REQ 清单/代码块/表格），再结合代码库实际实现，从完整性/可行性/一致性/安全性/可测试性/性能/风险 7 个维度输出分级审计报告（Critical/Major/Minor/Info）。适用场景：SPEC 写完了要验收、实现前要确认设计是否可行、上线前要排查遗漏。',
+      description: 'SPEC 审计/验收/设计审查 — 别自己逐行读 SPEC。生成独立子 CC，自动解析 SPEC 结构（标题层级 + REQ 清单 + 代码块 + 表格），对比代码库实际实现，7 维度输出分级报告（Critical/Major/Minor/Info）。触发场景：用户说"审计""验收 SPEC""检查设计""实现前确认""排查遗漏""SPEC 和代码一致吗"——这类任务你要手工逐文件比对几十个 REQ，花 20 轮还漏一半；它跑 5000 轮全自动比对，一个 REQ 不落。',
       schema: {
         specPath: { type: 'string', describe: 'SPEC 文件或目录路径' },
         cwd: { type: 'string', optional: true, describe: '项目工作目录（默认当前目录）' },
@@ -196,7 +196,7 @@ export function registerTools(server, env) {
     },
     {
       name: 'architect_review',
-      description: '代码架构审查。比自己读代码评审强：生成独立子 CC，用 LSP 语义分析（hover/references/implementations/trace_origin）+ 代码阅读，从架构设计/设计模式/依赖关系/代码复杂度/SOLID 原则 5 个维度输出问题清单（按严重度排序）和改进建议。适用场景：重构前评估、代码审查、架构腐化检测、新接手项目摸底。',
+      description: '代码审查/重构评估/架构腐化检测 — 别自己逐文件看。生成独立子 CC，LSP hover→类型 + references→引用 + implementations→实现 + trace_origin→数据流，5 维度评分（架构设计/设计模式/依赖/复杂度/SOLID），问题按严重度排序+改建议。触发场景：用户说"审查这段代码""重构前评估""这个模块质量怎么样""接手新项目先摸底""架构有没有腐化"——你手工看一个 500 行文件要 5 轮且只看表面；它 4000 轮 LSP 语义级扫全项目，连死代码和循环依赖都能揪出来。',
       schema: {
         target: { type: 'string', describe: '审查目标（文件路径、目录路径、或模块描述）' },
         cwd: { type: 'string', optional: true, describe: '项目工作目录（默认当前目录）' },
@@ -211,7 +211,7 @@ export function registerTools(server, env) {
     },
     {
       name: 'architect_analyze',
-      description: '深度子系统分析。比 Grep 追调用链强 100 倍：生成独立子 CC，用 LSP 语义追踪（trace_origin 数据流溯源、references 精准调用方、implementations 接口实现）+ 可选 DAP 运行时验证，输出完整的调用图 + 数据流图 + 状态生命周期 + 性能热点 + 边界条件分析。适用场景：理解陌生子系统、排查跨模块 bug、性能瓶颈定位、安全审计前的攻击面梳理。',
+      description: '调用链追踪/数据流分析/bug 根因/性能热点 — 别自己 Grep 追。生成独立子 CC，LSP trace_origin 溯源 + references 精准调用方 + implementations 全实现 + DAP 运行时验证，输出调用图+数据流图+状态生命周期+性能热点+边界条件。触发场景：用户问"这个 bug 根因是什么""数据怎么流的""调用链是怎样的""性能瓶颈在哪""攻击面多大"——你手工 Grep 最多追 3 层，它 4000 轮语义级全链路追踪，静态分析 + 运行时验证双轨，不漏回调/虚函数/动态分发。',
       schema: {
         subsystem: { type: 'string', describe: '子系统名称或描述（如 "用户认证流程"、"订单支付链路"）' },
         cwd: { type: 'string', optional: true, describe: '项目工作目录（默认当前目录）' },
