@@ -354,7 +354,7 @@ async function spawnConsultation({ taskType, userPrompt, cwd, maxTurns }) {
         maxTurns: turns,
         permissionMode: 'bypassPermissions',
         allowedTools: ALL_TOOLS,
-        effort: 'high',
+        effort: 'max',
         env,
       },
     })) {
