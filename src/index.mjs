@@ -11,7 +11,7 @@ import { resolve, extname } from 'path';
 // ── 环境变量加载（双模式：直接环境变量 > sh 脚本） ──
 
 function loadEnv() {
-  const envScript = process.env.ARCHITECT_ENV_SCRIPT || `${process.env.HOME}/.kocode.sh`;
+  const envScript = process.env.ARCHITECT_ENV_SCRIPT || `${process.env.HOME}/kocode.sh`;
   const env = { ...process.env };
 
   // 直接设置优先

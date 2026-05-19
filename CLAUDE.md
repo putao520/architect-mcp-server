@@ -24,12 +24,12 @@ Configurable via environment variables or shell script:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_BASE_URL` | from `~/.kocode.sh` | API endpoint |
-| `ANTHROPIC_AUTH_TOKEN` | from `~/.kocode.sh` | Auth token |
-| `ARCHITECT_ENV_SCRIPT` | `~/.kocode.sh` | Shell script to source env vars |
+| `ANTHROPIC_BASE_URL` | from `~/kocode.sh` | API endpoint |
+| `ANTHROPIC_AUTH_TOKEN` | from `~/kocode.sh` | Auth token |
+| `ARCHITECT_ENV_SCRIPT` | `~/kocode.sh` | Shell script to source env vars |
 | `ARCHITECT_MAX_TURNS` | `3000` | Global default max turns |
 
-Priority: direct env vars > ARCHITECT_ENV_SCRIPT > ~/.kocode.sh
+Priority: direct env vars > ARCHITECT_ENV_SCRIPT > ~/kocode.sh
 
 ## Tools
 
