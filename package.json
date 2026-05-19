@@ -1,0 +1,23 @@
+{
+  "name": "architect-mcp-server",
+  "version": "0.1.0",
+  "description": "Architect MCP Server — 架构顾问工具，通过 JS SDK 生成子 CC 执行深度分析、SPEC 审计、代码审查",
+  "type": "module",
+  "main": "src/index.mjs",
+  "bin": {
+    "architect-mcp-server": "src/index.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "web-tree-sitter": "^0.25.0",
+    "zod": "^3.25.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
