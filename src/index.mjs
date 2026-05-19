@@ -40,15 +40,40 @@ const env = loadEnv();
 
 // ── Tree-sitter 结构化解析 ──
 
-let tsParser = null;
+let tsParsers = null;
+const GRAMMAR_DIR = resolve(`${import.meta.dirname}`, 'grammars');
+
+const LANG_MAP = {
+  '.md': 'markdown', '.markdown': 'markdown',
+  '.rs': 'rust', '.py': 'python', '.go': 'go',
+  '.java': 'java', '.c': 'c', '.h': 'c',
+  '.cpp': 'cpp', '.hpp': 'cpp', '.cxx': 'cpp',
+  '.ts': 'typescript', '.tsx': 'typescript',
+  '.js': 'typescript', '.mjs': 'typescript',
+};
 
 async function initTreeSitter() {
-  if (tsParser) return;
+  if (tsParsers) return;
   try {
     const Parser = (await import('web-tree-sitter')).default;
     await Parser.init();
-    tsParser = { Parser };
-  } catch { tsParser = null; }
+    tsParsers = { Parser, languages: {} };
+    // Lazy load: languages are loaded on first use
+  } catch { tsParsers = null; }
+}
+
+async function getParser(ext) {
+  if (!tsParsers) return null;
+  const langName = LANG_MAP[ext];
+  if (!langName) return null;
+  if (tsParsers.languages[langName]) return tsParsers.languages[langName];
+  const wasmPath = resolve(GRAMMAR_DIR, `tree-sitter-${langName}.wasm`);
+  if (!existsSync(wasmPath)) return null;
+  try {
+    const lang = await tsParsers.Parser.Language.load(wasmPath);
+    tsParsers.languages[langName] = lang;
+    return lang;
+  } catch { return null; }
 }
 
 function extractMdStructure(content) {
@@ -113,9 +138,60 @@ function parseFileStructure(filePath) {
 
   const content = readFileSync(filePath, 'utf8');
 
-  if (ext === '.md') return { type: 'markdown', ...extractMdStructure(content) };
+  if (ext === '.md') {
+    const mdResult = { type: 'markdown', ...extractMdStructure(content) };
+    return mdResult;
+  }
 
-  // 源码文件用简单正则提取结构（不依赖 tree-sitter wasm）
+  // Try tree-sitter first, fallback to regex
+  return parseSourceFile(filePath, ext, content);
+}
+
+async function parseFileStructureAsync(filePath) {
+  const ext = extname(filePath).toLowerCase();
+  if (!existsSync(filePath)) return null;
+
+  const content = readFileSync(filePath, 'utf8');
+
+  if (ext === '.md') {
+    const lang = await getParser(ext);
+    if (lang && tsParsers) {
+      const parser = new tsParsers.Parser();
+      parser.setLanguage(lang);
+      const tree = parser.parse(content);
+      const result = { type: 'markdown', ...extractMdStructure(content), astNodeCount: countNodes(tree.rootNode) };
+      parser.delete();
+      tree.delete();
+      return result;
+    }
+    return { type: 'markdown', ...extractMdStructure(content) };
+  }
+
+  // Source files: try tree-sitter
+  const lang = await getParser(ext);
+  if (lang && tsParsers) {
+    try {
+      const parser = new tsParsers.Parser();
+      parser.setLanguage(lang);
+      const tree = parser.parse(content);
+      const functions = [];
+      const types = [];
+      const imports = [];
+      walkTree(tree.rootNode, (node) => {
+        if (isFunctionNode(node)) functions.push({ name: getNodeName(node, content), line: node.startPosition.row + 1 });
+        if (isTypeNode(node)) types.push({ name: getNodeName(node, content), line: node.startPosition.row + 1 });
+        if (isImportNode(node)) imports.push({ text: node.text.slice(0, 80), line: node.startPosition.row + 1 });
+      });
+      parser.delete();
+      tree.delete();
+      return { type: 'source', ext, functions, types, imports };
+    } catch { /* fallback */ }
+  }
+
+  return parseSourceFile(filePath, ext, content);
+}
+
+function parseSourceFile(filePath, ext, content) {
   const functions = [];
   const types = [];
   const imports = [];
@@ -130,6 +206,45 @@ function parseFileStructure(filePath) {
     if (imp) imports.push(imp[1]);
   }
   return { type: 'source', ext, functions, types, imports };
+}
+
+function countNodes(node) {
+  let count = 0;
+  for (let i = 0; i < node.childCount; i++) count += countNodes(node.child(i));
+  return 1 + count;
+}
+
+function walkTree(node, fn) {
+  fn(node);
+  for (let i = 0; i < node.childCount; i++) walkTree(node.child(i), fn);
+}
+
+function isFunctionNode(node) {
+  const t = node.type;
+  return t === 'function_declaration' || t === 'function_item' || t === 'function_definition'
+    || t === 'method_declaration' || t === 'arrow_function' || t === 'generator_function_declaration';
+}
+
+function isTypeNode(node) {
+  const t = node.type;
+  return t === 'interface_declaration' || t === 'type_alias_declaration' || t === 'struct_item'
+    || t === 'enum_declaration' || t === 'class_declaration' || t === 'type_definition';
+}
+
+function isImportNode(node) {
+  const t = node.type;
+  return t === 'import_statement' || t === 'import_declaration' || t === 'use_declaration'
+    || t === 'extern_crate_item' || t === 'include_directive';
+}
+
+function getNodeName(node, content) {
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i);
+    if (child.type === 'identifier' || child.type === 'name' || child.type === 'type_identifier') {
+      return content.slice(child.startIndex, child.endIndex);
+    }
+  }
+  return '';
 }
 
 // ── System Prompts ──
@@ -272,12 +387,12 @@ async function spawnConsultation({ taskType, userPrompt, cwd, maxTurns }) {
 
 // ── 结构化上下文构建 ──
 
-function buildStructuredContext(files) {
+async function buildStructuredContext(files) {
   if (!files?.length) return '';
   const parts = [];
   for (const f of files) {
     const resolved = resolve(f);
-    const parsed = parseFileStructure(resolved);
+    const parsed = await parseFileStructureAsync(resolved);
     if (parsed) parts.push(`File: ${resolved}\n${JSON.stringify(parsed, null, 2)}`);
   }
   return parts.length ? `\n\nStructured file context:\n${parts.join('\n\n')}` : '';
@@ -296,7 +411,7 @@ server.tool('architect_consult',
     maxTurns: z.number().optional().describe('子 CC 最大对话轮次（默认 3000）'),
   },
   async ({ prompt, cwd, context, maxTurns }) => {
-    const ctx = buildStructuredContext(context);
+    const ctx = await buildStructuredContext(context);
     return spawnConsultation({ taskType: 'consult', userPrompt: prompt + ctx, cwd, maxTurns });
   }
 );
@@ -311,7 +426,7 @@ server.tool('architect_audit',
   },
   async ({ specPath, cwd, dimensions, maxTurns }) => {
     const resolved = resolve(specPath);
-    const parsed = parseFileStructure(resolved);
+    const parsed = await parseFileStructureAsync(resolved);
     let userPrompt = `审计 SPEC: ${specPath}`;
     if (parsed) userPrompt += `\n\nSPEC 结构:\n${JSON.stringify(parsed, null, 2)}`;
     if (dimensions.length) userPrompt += `\n\n重点审计维度: ${dimensions.join('、')}`;
@@ -352,7 +467,7 @@ server.tool('architect_analyze',
     };
     let userPrompt = `分析子系统: ${subsystem}\n分析类型: ${typeMap[analysisType]}`;
     if (entryPoints.length) {
-      const ctx = buildStructuredContext(entryPoints);
+      const ctx = await buildStructuredContext(entryPoints);
       userPrompt += `\n\n入口文件:\n${entryPoints.map(f => `- ${f}`).join('\n')}${ctx}`;
     }
     return spawnConsultation({ taskType: 'analyze', userPrompt, cwd, maxTurns: maxTurns || 4000 });
