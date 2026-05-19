@@ -14,6 +14,10 @@ function loadEnv() {
   const envScript = process.env.ARCHITECT_ENV_SCRIPT || `${process.env.HOME}/kocode.sh`;
   const env = { ...process.env };
 
+  // 清理主 CC 特有配置，避免子 CC 继承后 API 报错
+  delete env.CLAUDE_CODE_EFFORT_LEVEL;
+  delete env.CLAUDE_CODE_FORCE_EFFORT;
+
   // 直接设置优先
   if (process.env.ANTHROPIC_BASE_URL && process.env.ANTHROPIC_AUTH_TOKEN) {
     return env;
@@ -350,6 +354,7 @@ async function spawnConsultation({ taskType, userPrompt, cwd, maxTurns }) {
         maxTurns: turns,
         permissionMode: 'bypassPermissions',
         allowedTools: ALL_TOOLS,
+        effort: 'high',
         env,
       },
     })) {
