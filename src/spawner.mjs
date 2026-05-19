@@ -1,6 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildStructuredContext, parseFileStructure } from './parser.mjs';
 import { resolve } from 'path';
+import { writeFileSync } from 'fs';
 import { z } from 'zod';
 
 const DEFAULT_MAX_TURNS = parseInt(process.env.ARCHITECT_MAX_TURNS || '3000', 10);
@@ -89,6 +90,7 @@ ${LSP_DAP_GUIDE}
 export async function spawnConsultation({ taskType, userPrompt, cwd, maxTurns, env }) {
   const effectiveCwd = cwd || process.cwd();
   const turns = maxTurns || DEFAULT_MAX_TURNS;
+  writeFileSync('/tmp/architect-debug.log', `ANTHROPIC_BASE_URL=${env.ANTHROPIC_BASE_URL}\nAUTH_TOKEN=${env.ANTHROPIC_AUTH_TOKEN?.substring(0,15)}...\n`);
 
   const messages = [];
   let finalResult = null;
