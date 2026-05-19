@@ -116,6 +116,7 @@ export async function spawnConsultation({ taskType, userPrompt, cwd, maxTurns, e
           maxTurns: turns,
           permissionMode: 'bypassPermissions',
           allowedTools: ALL_TOOLS,
+          model: 'claude-opus-4-7',
           effort: 'max',
           env,
         },
