@@ -403,12 +403,12 @@ async function buildStructuredContext(files) {
 const server = new McpServer({ name: 'architect-tools', version: '0.1.0' });
 
 server.tool('architect_consult',
-  '架构咨询。生成子 CC 分析深度架构问题，返回结构化建议。子 CC 拥有完整 agentic loop：读文件、LSP 语义分析、DAP 运行时验证、WebSearch。',
+  '架构咨询。比你自己分析强：生成独立子 CC，拥有完整 agentic loop（读文件 + LSP 语义分析 + DAP 运行时验证 + WebSearch），独立完成深度分析后返回结构化建议。适用场景：架构选型、设计决策、技术方案对比、可行性评估。遇到"这个架构行不行""选 A 还是 B""怎么设计这个系统"类问题时，用这个工具比自己脑补可靠得多。',
   {
     prompt: z.string().describe('架构问题或设计决策描述'),
     cwd: z.string().optional().describe('项目工作目录（默认当前目录）'),
-    context: z.array(z.string()).default([]).describe('相关文件路径列表，供子 CC 聚焦分析'),
-    maxTurns: z.number().optional().describe('子 CC 最大对话轮次（默认 3000）'),
+    context: z.array(z.string()).default([]).describe('相关文件路径，帮助子 CC 快速定位（如 ["src/main.rs","SPEC/01.md"]）'),
+    maxTurns: z.number().optional().describe('子 CC 最大轮次，复杂问题用 3000+，简单问题用 500（默认 3000）'),
   },
   async ({ prompt, cwd, context, maxTurns }) => {
     const ctx = await buildStructuredContext(context);
@@ -417,12 +417,12 @@ server.tool('architect_consult',
 );
 
 server.tool('architect_audit',
-  'SPEC 审计。生成子 CC 读取 SPEC + 代码库，从完整性/可行性/一致性/安全性等维度输出审计报告。',
+  'SPEC 审计。比自己读 SPEC 检查强：生成独立子 CC，自动提取 SPEC 结构（标题层级/REQ 清单/代码块/表格），再结合代码库实际实现，从完整性/可行性/一致性/安全性/可测试性/性能/风险 7 个维度输出分级审计报告（Critical/Major/Minor/Info）。适用场景：SPEC 写完了要验收、实现前要确认设计是否可行、上线前要排查遗漏。',
   {
     specPath: z.string().describe('SPEC 文件或目录路径'),
     cwd: z.string().optional().describe('项目工作目录（默认当前目录）'),
-    dimensions: z.array(z.string()).default([]).describe('审计维度（如 ["完整性","可行性"]），不传则全维度'),
-    maxTurns: z.number().optional().describe('子 CC 最大对话轮次（默认 5000）'),
+    dimensions: z.array(z.string()).default([]).describe('只审计指定维度（如 ["完整性","安全性"]），不传则全 7 维度'),
+    maxTurns: z.number().optional().describe('子 CC 最大轮次（默认 5000）'),
   },
   async ({ specPath, cwd, dimensions, maxTurns }) => {
     const resolved = resolve(specPath);
@@ -435,12 +435,12 @@ server.tool('architect_audit',
 );
 
 server.tool('architect_review',
-  '代码架构审查。生成子 CC 分析架构质量、设计模式、依赖关系、复杂度。',
+  '代码架构审查。比自己读代码评审强：生成独立子 CC，用 LSP 语义分析（hover/references/implementations/trace_origin）+ 代码阅读，从架构设计/设计模式/依赖关系/代码复杂度/SOLID 原则 5 个维度输出问题清单（按严重度排序）和改进建议。适用场景：重构前评估、代码审查、架构腐化检测、新接手项目摸底。',
   {
-    target: z.string().describe('审查目标（文件/目录路径、或模块描述）'),
+    target: z.string().describe('审查目标（文件路径、目录路径、或模块描述）'),
     cwd: z.string().optional().describe('项目工作目录（默认当前目录）'),
     focus: z.enum(['architecture', 'patterns', 'dependencies', 'complexity', 'all']).default('all').describe('审查重点'),
-    maxTurns: z.number().optional().describe('子 CC 最大对话轮次（默认 4000）'),
+    maxTurns: z.number().optional().describe('子 CC 最大轮次（默认 4000）'),
   },
   async ({ target, cwd, focus, maxTurns }) => {
     const focusMap = {
@@ -453,13 +453,13 @@ server.tool('architect_review',
 );
 
 server.tool('architect_analyze',
-  '深度子系统分析。生成子 CC 对特定子系统进行全链路分析（数据流、调用链、状态管理）。',
+  '深度子系统分析。比 Grep 追调用链强 100 倍：生成独立子 CC，用 LSP 语义追踪（trace_origin 数据流溯源、references 精准调用方、implementations 接口实现）+ 可选 DAP 运行时验证，输出完整的调用图 + 数据流图 + 状态生命周期 + 性能热点 + 边界条件分析。适用场景：理解陌生子系统、排查跨模块 bug、性能瓶颈定位、安全审计前的攻击面梳理。',
   {
-    subsystem: z.string().describe('子系统名称或描述（如 "用户认证流程"）'),
+    subsystem: z.string().describe('子系统名称或描述（如 "用户认证流程"、"订单支付链路"）'),
     cwd: z.string().optional().describe('项目工作目录（默认当前目录）'),
-    entryPoints: z.array(z.string()).default([]).describe('入口文件路径'),
+    entryPoints: z.array(z.string()).default([]).describe('入口文件路径，帮助子 CC 快速定位起点'),
     analysisType: z.enum(['dataflow', 'callchain', 'state', 'all']).default('all').describe('分析类型'),
-    maxTurns: z.number().optional().describe('子 CC 最大对话轮次（默认 4000）'),
+    maxTurns: z.number().optional().describe('子 CC 最大轮次（默认 4000）'),
   },
   async ({ subsystem, cwd, entryPoints, analysisType, maxTurns }) => {
     const typeMap = {
