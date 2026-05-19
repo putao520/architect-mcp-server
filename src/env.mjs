@@ -1,27 +1,45 @@
-import { execFileSync } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
+import { resolve } from 'path';
+
+function loadProvider(providerName = 'kocode') {
+  const configPath = resolve(process.env.HOME, '.gsc', 'providers', `${providerName}.json`);
+  if (!existsSync(configPath)) return null;
+  try {
+    return JSON.parse(readFileSync(configPath, 'utf8'));
+  } catch { return null; }
+}
 
 export function loadEnv() {
-  const envScript = process.env.ARCHITECT_ENV_SCRIPT || `${process.env.HOME}/kocode.sh`;
+  const provider = loadProvider(process.env.ARCHITECT_PROVIDER || 'kocode');
   const env = { ...process.env };
 
-  // 清理主 CC 特有配置，避免子 CC 继承后 API 报错
+  // 清理主 CC 特有配置
   delete env.CLAUDE_CODE_EFFORT_LEVEL;
   delete env.CLAUDE_CODE_FORCE_EFFORT;
 
-  // 从 sh 脚本提取 export 行覆盖 ANTHROPIC_* / CLAUDE_* / ENABLE_*
-  // 不 source 整个脚本（末尾有 claude 命令会阻塞/hang）
-  if (existsSync(envScript)) {
-    try {
-      const output = execFileSync('bash', ['-c',
-        `grep -E '^export (ANTHROPIC_|CLAUDE_|ENABLE_)' '${envScript}' | sed 's/^export //'`
-      ], { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
-      for (const line of output.trim().split('\n')) {
-        const m = line.match(/^(\w+)="?([^"]*)"?$/);
-        if (m) env[m[1]] = m[2];
-      }
-    } catch { /* fallback to process.env */ }
+  if (!provider) return env;
+
+  env.ANTHROPIC_BASE_URL = provider.endpoint;
+  const enabled = (provider.accounts || []).filter(a => a.enabled !== false);
+  if (enabled.length > 0) {
+    env.ANTHROPIC_AUTH_TOKEN = enabled[0].token;
+  }
+  if (provider.env) {
+    for (const e of provider.env) {
+      env[e.name] = e.value;
+    }
   }
 
   return env;
+}
+
+export function getAccounts(providerName = 'kocode') {
+  const provider = loadProvider(providerName);
+  if (!provider) return [];
+  return (provider.accounts || []).filter(a => a.enabled !== false);
+}
+
+export function getEndpoint(providerName = 'kocode') {
+  const provider = loadProvider(providerName);
+  return provider?.endpoint || null;
 }

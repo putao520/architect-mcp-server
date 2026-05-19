@@ -86,6 +86,19 @@ ${LSP_DAP_GUIDE}
 输出格式：调用图 + 数据流图 + 关键发现。`,
 };
 
+async function retryWithBackoff(fn, maxRetries = 3) {
+  for (let i = 0; i <= maxRetries; i++) {
+    try { return await fn(); } catch (err) {
+      if (i < maxRetries && /503|no available account/i.test(err.message || '')) {
+        const delay = Math.pow(2, i) * 1000;
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export async function spawnConsultation({ taskType, userPrompt, cwd, maxTurns, env }) {
   const effectiveCwd = cwd || process.cwd();
   const turns = maxTurns || DEFAULT_MAX_TURNS;
@@ -94,26 +107,28 @@ export async function spawnConsultation({ taskType, userPrompt, cwd, maxTurns, e
   let finalResult = null;
 
   try {
-    for await (const message of query({
-      prompt: userPrompt,
-      options: {
-        systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_PROMPTS[taskType] },
-        cwd: effectiveCwd,
-        maxTurns: turns,
-        permissionMode: 'bypassPermissions',
-        allowedTools: ALL_TOOLS,
-        effort: 'max',
-        env,
-      },
-    })) {
-      if (message.type === 'assistant' && message.message?.content) {
-        for (const block of message.message.content) {
-          if ('text' in block && block.text) messages.push(block.text);
+    await retryWithBackoff(async () => {
+      for await (const message of query({
+        prompt: userPrompt,
+        options: {
+          systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_PROMPTS[taskType] },
+          cwd: effectiveCwd,
+          maxTurns: turns,
+          permissionMode: 'bypassPermissions',
+          allowedTools: ALL_TOOLS,
+          effort: 'max',
+          env,
+        },
+      })) {
+        if (message.type === 'assistant' && message.message?.content) {
+          for (const block of message.message.content) {
+            if ('text' in block && block.text) messages.push(block.text);
+          }
+        } else if (message.type === 'result') {
+          finalResult = message;
         }
-      } else if (message.type === 'result') {
-        finalResult = message;
       }
-    }
+    });
   } catch (err) {
     const full = messages.join('\n');
     const head = full.slice(0, 4000);
