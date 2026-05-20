@@ -7,7 +7,7 @@ import { initTreeSitter } from './parser.mjs';
 import { registerTools } from './spawner.mjs';
 
 const env = loadEnv();
-const server = new McpServer({ name: 'architect-tools', version: '0.2.0' });
+const server = new McpServer({ name: 'architect-tools', version: '0.3.0' });
 
 registerTools(server, env);
 

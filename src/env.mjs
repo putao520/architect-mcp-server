@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 
-function loadProvider(providerName = 'kocode') {
+export function loadProvider(providerName = 'kocode') {
   const configPath = resolve(process.env.HOME, '.gsc', 'providers', `${providerName}.json`);
   if (!existsSync(configPath)) return null;
   try {
