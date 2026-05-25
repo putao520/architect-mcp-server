@@ -1,6 +1,6 @@
 {
   "name": "architect-mcp-server",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Architect MCP Server — 架构顾问工具，通过 JS SDK 生成子 CC 执行深度分析、SPEC 审计、代码审查",
   "type": "module",
   "main": "src/index.mjs",
@@ -15,6 +15,8 @@
     "@modelcontextprotocol/sdk": "^1.12.0",
     "koffi": "^3.0.1",
     "web-tree-sitter": "^0.25.0",
+    "ws": "^8.20.1",
+    "z3-solver": "^4.16.0",
     "zod": "^3.25.0"
   },
   "engines": {
