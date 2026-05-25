@@ -1,12 +1,18 @@
 #!/usr/bin/env node
-// rwkv-server.mjs — 独立 RWKV 推理服务（单进程，多 MCP server 共享）
-// 架构：独立 HTTP 服务 → 多个 MCP server 实例通过 HTTP 调用 → 模型只加载一次
+// UV_THREADPOOL_SIZE must be set before any libuv work (including imports that trigger fs/net)
+process.env.UV_THREADPOOL_SIZE = process.env.UV_THREADPOOL_SIZE || '8';
+
+// rwkv-server.mjs — WebSocket RWKV 推理服务
+// 架构：WebSocket 长连接 + SessionManager（GPU pool slot 管理 + LRU 保护） + 流式 token 输出
+// 所有工具调用走 WS 协议，保留 /health GET 用于存活检查
 
 import http from 'http';
+import { WebSocketServer } from 'ws';
 import { join, dirname, resolve, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync, readFileSync, writeFileSync, statSync, readdirSync, mkdirSync } from 'fs';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
+import { RwkvSession } from './rwkv-binding.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -14,6 +20,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 let model = null;
 let tokenizer = null;
+let modelHealth = { loadTime: 0, errorCount: 0, lastError: null, totalRequests: 0 };
 
 const MODEL_PATHS = [
   process.env.RWKV_MODEL_PATH,
@@ -37,14 +44,22 @@ async function loadModel() {
 
   const gpuLayers = parseInt(process.env.RWKV_GPU_LAYERS || '32', 10);
   const threads = parseInt(process.env.RWKV_THREADS || '4', 10);
+  const poolMaxSlots = parseInt(process.env.RWKV_POOL_SLOTS || '8', 10);
 
-  model = new RwkvModel(modelPath, { threads, gpuLayers });
+  model = new RwkvModel(modelPath, { threads, gpuLayers, poolMaxSlots });
   tokenizer = new RwkvTokenizer(VOCAB_PATH);
+  modelHealth.loadTime = Date.now();
+}
+
+// === WS 发送辅助 ===
+
+function wsSend(ws, msg) {
+  if (ws.readyState === 1) ws.send(JSON.stringify(msg));
 }
 
 // === 文件读取 ===
 
-function readFilesAsContext(files, cwd, maxFileBytes = 200_000) {
+function readFilesAsContext(files, cwd, maxFileBytes = 100_000_000) {
   const parts = [];
   for (const f of files) {
     const abs = resolve(cwd || process.cwd(), f);
@@ -80,6 +95,166 @@ function readOneFile(displayPath, absPath, maxBytes = 200_000) {
   } catch (e) {
     return `[${displayPath}] READ ERROR: ${e.message}`;
   }
+}
+
+// === SessionManager — GPU pool slot 管理 + LRU 保护 ===
+
+class SessionManager {
+  #sessions = new Map();
+  #model;
+  #tokenizer;
+
+  constructor(model, tokenizer) {
+    this.#model = model;
+    this.#tokenizer = tokenizer;
+  }
+
+  /** 创建新 session（异步，排队等 GPU slot） */
+  async create() {
+    const session = await RwkvSession.create(this.#model, this.#tokenizer);
+    const id = randomUUID();
+    this.#sessions.set(id, { session, lastUsed: Date.now(), pinned: false });
+    return { id, session };
+  }
+
+  get(id) {
+    const entry = this.#sessions.get(id);
+    if (!entry) return null;
+    entry.lastUsed = Date.now();
+    return entry.session;
+  }
+
+  destroy(id) {
+    const entry = this.#sessions.get(id);
+    if (!entry) { return; }
+    entry.session.destroy();
+    this.#sessions.delete(id);
+  }
+
+  /** Abort all active sessions (used on WS close to cancel running tool handlers) */
+  abortAll() {
+    for (const [, entry] of this.#sessions) {
+      entry.session.abort();
+    }
+  }
+
+  pin(id) {
+    const entry = this.#sessions.get(id);
+    if (entry) entry.pinned = true;
+  }
+
+  unpin(id) {
+    const entry = this.#sessions.get(id);
+    if (entry) entry.pinned = false;
+  }
+
+  get size() { return this.#sessions.size; }
+
+  /** Destroy all sessions (emergency cleanup on WS close) */
+  destroyAll() {
+    for (const id of [...this.#sessions.keys()]) this.destroy(id);
+  }
+
+  destroyAll() {
+    for (const id of [...this.#sessions.keys()]) this.destroy(id);
+  }
+}
+
+let sessionManager = null;
+
+// === 流式生成辅助 ===
+
+const GEN_OPTS = { alphaPresence: 2.0, alphaFrequency: 0.1, alphaDecay: 0.99 };
+const DEEP_THINK = { ...GEN_OPTS, maxRounds: 3, maxThinkTokens: 2048, maxAnswerTokens: 4096 };
+
+function nlTokenId() {
+  return tokenizer.encode('\n')[0];
+}
+
+async function streamGenerate(session, maxTokens, opts, ws, requestId) {
+  const tokens = [];
+  for (let i = 0; i < maxTokens; i++) {
+    if (session.isAborted) break;
+    const tid = await session.generateToken(opts);
+    tokens.push(tid);
+    wsSend(ws, { requestId, type: 'token', text: tokenizer.decode([tid]), tokenId: tid, index: i });
+  }
+  return tokenizer.decode(tokens);
+}
+
+async function streamThinkGenerate(session, maxAnswerTokens, opts, ws, requestId) {
+  const { maxThinkTokens = 4096, ...genOpts } = opts;
+  const nlId = nlTokenId();
+
+  const thinkTokens = [];
+  for (let i = 0; i < maxThinkTokens; i++) {
+    if (session.isAborted) break;
+    const tid = await session.generateToken(genOpts);
+    thinkTokens.push(tid);
+    if (tid === nlId) break;
+  }
+  const thinking = tokenizer.decode(thinkTokens).replace(/\n$/, '');
+
+  const answerTokens = [];
+  for (let i = 0; i < maxAnswerTokens; i++) {
+    if (session.isAborted) break;
+    const tid = await session.generateToken(genOpts);
+    answerTokens.push(tid);
+    wsSend(ws, { requestId, type: 'token', text: tokenizer.decode([tid]), tokenId: tid, index: i });
+  }
+  const answer = tokenizer.decode(answerTokens);
+  return { thinking, answer };
+}
+
+async function streamMultiRoundThink(session, prompt, opts, ws, requestId) {
+  const { maxRounds = 5, maxThinkTokens = 2048, maxAnswerTokens = 2048, systemPrompt, history = [], ...genOpts } = opts;
+  const nlId = nlTokenId();
+  const rounds = [];
+  let converged = false;
+
+  await session.feedChatPrompt(prompt, { systemPrompt, history, think: true });
+
+  for (let round = 0; round < maxRounds; round++) {
+    if (session.isAborted) break;
+
+    const thinkTokens = [];
+    for (let i = 0; i < maxThinkTokens; i++) {
+      if (session.isAborted) break;
+      const tid = await session.generateToken(genOpts);
+      thinkTokens.push(tid);
+      if (tid === nlId) break;
+    }
+    const thinking = tokenizer.decode(thinkTokens).replace(/\n$/, '');
+
+    const answerTokens = [];
+    for (let i = 0; i < maxAnswerTokens; i++) {
+      if (session.isAborted) break;
+      const tid = await session.generateToken(genOpts);
+      answerTokens.push(tid);
+      wsSend(ws, { requestId, type: 'token', text: tokenizer.decode([tid]), tokenId: tid, round, index: i });
+    }
+    const answer = tokenizer.decode(answerTokens);
+    rounds.push({ thinking, answer });
+
+    if (rounds.length >= 2) {
+      const prev = rounds[rounds.length - 2].thinking;
+      const curr = rounds[rounds.length - 1].thinking;
+      if (curr.trim() === prev.trim()) { converged = true; break; }
+      if (curr.length < prev.length * 0.2 && curr.length < 50) { converged = true; break; }
+    }
+
+    if (round < maxRounds - 1 && !converged) {
+      await session.feedPrompt(`\nUser: Continue reasoning. Go deeper into the analysis.\nAssistant:\n`);
+    }
+  }
+
+  return {
+    rounds,
+    totalRounds: rounds.length,
+    converged,
+    finalAnswer: rounds[rounds.length - 1].answer,
+    allThinking: rounds.map(r => r.thinking).join('\n---\n'),
+  };
 }
 
 // === DAG 执行引擎 ===
@@ -125,85 +300,90 @@ const NODE_PROMPTS = {
   structure: 'Map the architectural structure: module boundaries, abstraction layers, dependency graph, and key design decisions. Focus on the overall shape, not individual components.',
 };
 
-const GEN_OPTS = { alphaPresence: 2.0, alphaFrequency: 0.1, alphaDecay: 0.99 };
-const DEEP_THINK = { ...GEN_OPTS, maxRounds: 3, maxThinkTokens: 2048, maxAnswerTokens: 4096 };
-
-async function executeDAG(args) {
-  const { RwkvSession } = await import('./rwkv-binding.mjs');
+async function executeDAG(args, ws, requestId) {
   const { problem, files, context, nodes, deps, cwd } = args;
-
   const fileContext = files?.length ? readFilesAsContext(files, cwd) : '';
 
-  // RWKV-7 G1 chat template 构建基础 session
-  const baseSession = new RwkvSession(model, tokenizer);
-  const userContent = [
-    problem,
-    fileContext ? `Context Files:\n${fileContext}` : '',
-    context ? `Additional Context:\n${context}` : '',
-  ].filter(Boolean).join('\n\n');
+  const { id: baseId, session: baseSession } = await sessionManager.create();
+  sessionManager.pin(baseId);
+  try {
+    const userContent = [
+      problem,
+      fileContext ? `Context Files:\n${fileContext}` : '',
+      context ? `Additional Context:\n${context}` : '',
+    ].filter(Boolean).join('\n\n');
 
-  baseSession.feedChatPrompt(userContent, {
-    systemPrompt: 'You are an abstract reasoning engine. Analyze at the highest level of abstraction. Identify core patterns, hidden relationships, and architectural principles.',
-  });
-  const baseState = baseSession.exportState();
+    await baseSession.feedChatPrompt(userContent, {
+      systemPrompt: 'You are an abstract reasoning engine. Analyze at the highest level of abstraction. Identify core patterns, hidden relationships, and architectural principles.',
+    });
+    const baseState = await baseSession.exportState();
 
-  // 拓扑排序 DAG 为层级
-  const levels = topoSortLevels(nodes, deps);
-  const results = {};
-  const nodeMap = new Map(nodes.map(n => [n.id, n]));
+    const levels = topoSortLevels(nodes, deps);
+    const results = {};
+    const nodeMap = new Map(nodes.map(n => [n.id, n]));
 
-  // 逐层执行（Think mode）
-  for (const level of levels) {
-    for (const node of level) {
-      const nodeSession = new RwkvSession(model, tokenizer);
-      nodeSession.importState(baseState);
+    for (const level of levels) {
+      for (const node of level) {
+        const { id: nodeId, session: nodeSession } = await sessionManager.create();
+        sessionManager.pin(nodeId);
+        try {
+          await nodeSession.importState(baseState);
 
-      const parentIds = (deps || []).filter(d => d.to === node.id).map(d => d.from);
-      const parentPart = parentIds.length > 0
-        ? parentIds.map(pid => `Result from [${pid}]:\n${results[pid] || '(no result)'}`).join('\n\n') + '\n\n'
-        : '';
+          const parentIds = (deps || []).filter(d => d.to === node.id).map(d => d.from);
+          const parentPart = parentIds.length > 0
+            ? parentIds.map(pid => `Result from [${pid}]:\n${results[pid] || '(no result)'}`).join('\n\n') + '\n\n'
+            : '';
 
-      const nodeQuery = `${NODE_PROMPTS[node.type || 'abstract']}\n\nTask [${node.id}]: ${node.query}\n${parentPart}`;
-
-      nodeSession.feedChatPrompt(nodeQuery, { think: true });
-      const { answer } = nodeSession.thinkGenerate(2048, GEN_OPTS);
-      results[node.id] = answer;
+          const nodeQuery = `${NODE_PROMPTS[node.type || 'abstract']}\n\nTask [${node.id}]: ${node.query}\n${parentPart}`;
+          await nodeSession.feedChatPrompt(nodeQuery, { think: true });
+          const { answer } = await streamThinkGenerate(nodeSession, 2048, GEN_OPTS, ws, requestId);
+          results[node.id] = answer;
+        } finally {
+          sessionManager.unpin(nodeId);
+          sessionManager.destroy(nodeId);
+        }
+      }
     }
+
+    const { id: synthId, session: synthSession } = await sessionManager.create();
+    sessionManager.pin(synthId);
+    try {
+      await synthSession.importState(baseState);
+      const allResults = Object.entries(results)
+        .map(([id, text]) => `[${id}]: ${text}`)
+        .join('\n\n---\n\n');
+
+      const synthResult = await streamMultiRoundThink(
+        synthSession,
+        `All reasoning results:\n${allResults}\n\nNow synthesize all results into a unified, high-level conclusion. Identify cross-cutting themes, contradictions, and the overall architectural insight. Be abstract and conceptual.`,
+        DEEP_THINK, ws, requestId
+      );
+      const synthesis = synthResult.finalAnswer;
+
+      const out = [`ABSTRACT REASONING COMPLETE`];
+      out.push(`Nodes: ${nodes.length} | Levels: ${levels.length} | Engine: RWKV-7 G1 (Think mode)`);
+
+      for (const [id, text] of Object.entries(results)) {
+        const node = nodeMap.get(id);
+        out.push(`\n## [${id}] (${node?.type || 'abstract'})`);
+        out.push(text);
+      }
+
+      out.push('\n## Synthesis');
+      out.push(synthesis);
+
+      return { content: [{ type: 'text', text: out.join('\n') }] };
+    } finally {
+      sessionManager.unpin(synthId);
+      sessionManager.destroy(synthId);
+    }
+  } finally {
+    sessionManager.unpin(baseId);
+    sessionManager.destroy(baseId);
   }
-
-  // 综合推理（多轮 Think — 综合多个节点结果需要更深度推理）
-  const synthSession = new RwkvSession(model, tokenizer);
-  synthSession.importState(baseState);
-
-  const allResults = Object.entries(results)
-    .map(([id, text]) => `[${id}]: ${text}`)
-    .join('\n\n---\n\n');
-
-  const synthResult = synthSession.multiRoundThink(
-    `All reasoning results:\n${allResults}\n\nNow synthesize all results into a unified, high-level conclusion. Identify cross-cutting themes, contradictions, and the overall architectural insight. Be abstract and conceptual.`,
-    DEEP_THINK
-  );
-  const synthesis = synthResult.finalAnswer;
-
-  // 格式化输出
-  const out = [`ABSTRACT REASONING COMPLETE`];
-  out.push(`Nodes: ${nodes.length} | Levels: ${levels.length} | Engine: RWKV-7 G1 (Think mode)`);
-
-  for (const [id, text] of Object.entries(results)) {
-    const node = nodeMap.get(id);
-    out.push(`\n## [${id}] (${node?.type || 'abstract'})`);
-    out.push(text);
-  }
-
-  out.push('\n## Synthesis');
-  out.push(synthesis);
-
-  return { content: [{ type: 'text', text: out.join('\n') }] };
 }
 
-// === Deep Read — 超大文件读取理解 ===
-// RWKV 纯 RNN 优势：O(1) 每token推理，WKV state 固定 20.63MB
-// 可以 feed 整个超大文件（无 Transformer 的上下文窗口限制），然后用 Think mode 回答问题
+// === Deep Read ===
 
 const DEEP_READ_MODES = {
   extract: 'Extract specific information from the context above to answer the question. Be precise, include relevant details and exact references.',
@@ -212,102 +392,37 @@ const DEEP_READ_MODES = {
   qa: 'Answer the question based on the context above. If the answer cannot be found, explicitly state what is missing.',
 };
 
-// 先粗后精（两阶段）
-// 阶段1：分段摘要 — 每个分块独立处理，避免信息衰减
-// 阶段2：摘要定位 + 精读回答 — 只对相关分块做 Think mode 深度推理
-
-async function deepRead(args) {
-  const { RwkvSession } = await import('./rwkv-binding.mjs');
-  const { files, question, mode = 'qa', cwd, maxTokens = 500000 } = args;
-
+async function deepRead(args, ws, requestId) {
+  const { files, question, mode = 'qa', cwd } = args;
   const content = readFilesAsContext(files, cwd, 100_000_000);
   if (!content.trim()) {
     return { content: [{ type: 'text', text: 'DEEP READ: No content found in specified files.' }] };
   }
 
-  // 按换行符边界分块（~50K tokens per chunk ≈ 200KB 文本）
-  const CHUNK_CHARS = 200_000;
-  const chunks = [];
+  const modePrompt = DEEP_READ_MODES[mode] || DEEP_READ_MODES.qa;
+  const fileSizeKB = (content.length / 1024).toFixed(0);
 
-  for (let i = 0; i < content.length; i += CHUNK_CHARS) {
-    let end = Math.min(i + CHUNK_CHARS, content.length);
-    if (end < content.length) {
-      const lastNl = content.lastIndexOf('\n', end);
-      if (lastNl > i) end = lastNl + 1;
-    }
-    chunks.push(content.slice(i, end));
-  }
-
-  // === 单分块：直接精读 ===
-  if (chunks.length === 1) {
-    const session = new RwkvSession(model, tokenizer);
-    session.feedPrompt(chunks[0]);
-    const modePrompt = DEEP_READ_MODES[mode] || DEEP_READ_MODES.qa;
-
+  const { id: sid, session } = await sessionManager.create();
+  sessionManager.pin(sid);
+  try {
+    // RWKV 线性注意力：固定 20.63MB state，全文直接 feed，无上下文窗口限制
+    await session.feedPrompt(content);
     let answer;
     if (mode === 'analyze') {
-      // 深度分析用多轮 Think
-      const mr = session.multiRoundThink(`${modePrompt}\n\nQuestion: ${question.replace(/\n\n/g, '\n')}`, DEEP_THINK);
+      const mr = await streamMultiRoundThink(session, `${modePrompt}\n\nQuestion: ${question.replace(/\n\n/g, '\n')}`, DEEP_THINK, ws, requestId);
       answer = mr.finalAnswer;
     } else {
-      session.feedPrompt(`\n\nUser: ${modePrompt}\n\nQuestion: ${question.replace(/\n\n/g, '\n')}\nAssistant:\n`);
-      answer = session.thinkGenerate(4096, GEN_OPTS).answer;
+      await session.feedPrompt(`\n\nUser: ${modePrompt}\n\nQuestion: ${question.replace(/\n\n/g, '\n')}\nAssistant:\n`);
+      answer = await streamGenerate(session, 2048, GEN_OPTS, ws, requestId);
     }
-
-    return { content: [{ type: 'text', text: `DEEP READ COMPLETE\nMode: ${mode} | Single section\n\n## Answer\n${answer}` }] };
+    return { content: [{ type: 'text', text: `DEEP READ COMPLETE\nMode: ${mode} | Input: ${fileSizeKB}KB (full context, no truncation)\n\n## Answer\n${answer}` }] };
+  } finally {
+    sessionManager.unpin(sid);
+    sessionManager.destroy(sid);
   }
-
-  // === 多分块：先粗后精 ===
-
-  // 阶段1：分段摘要（每个 chunk 独立 session，信息无衰减）
-  const chunkSummaries = [];
-  for (let ci = 0; ci < chunks.length; ci++) {
-    const s = new RwkvSession(model, tokenizer);
-    s.feedPrompt(chunks[ci]);
-    s.feedPrompt('\n\nUser: Summarize the key content of this section in 2-3 sentences. Main topics, key terms, important data.\nAssistant:\n');
-    const { answer } = s.thinkGenerate(512, GEN_OPTS);
-    chunkSummaries.push(answer);
-  }
-
-  // 阶段2a：从摘要中定位相关 chunks
-  const summariesText = chunkSummaries.map((sum, i) => `[Section ${i}]: ${sum}`).join('\n');
-  const selectSession = new RwkvSession(model, tokenizer);
-  selectSession.feedChatPrompt(
-    `A document has ${chunks.length} sections with these summaries:\n\n${summariesText}\n\nQuestion: ${question}\n\nWhich sections are most relevant to answer this question? List only the section numbers separated by commas.`,
-    {}
-  );
-  const selectionRaw = selectSession.generate(128, { ...GEN_OPTS, temperature: 0.3 });
-
-  // 提取 section 编号
-  const selectedIndices = [...new Set(
-    [...selectionRaw.matchAll(/\d+/g)].map(m => parseInt(m[0], 10)).filter(i => i >= 0 && i < chunks.length)
-  )].slice(0, 5);
-  const targetIndices = selectedIndices.length > 0 ? selectedIndices : [0];
-
-  // 阶段2b：精读相关 chunks（独立 session，信息完整）
-  const relevantContent = targetIndices.map(i => chunks[i]).join('\n\n---\n\n');
-  const answerSession = new RwkvSession(model, tokenizer);
-  answerSession.feedPrompt(relevantContent);
-  const modePrompt = DEEP_READ_MODES[mode] || DEEP_READ_MODES.qa;
-
-  let answer;
-  if (mode === 'analyze') {
-    const mr = answerSession.multiRoundThink(`${modePrompt}\n\nQuestion: ${question.replace(/\n\n/g, '\n')}`, DEEP_THINK);
-    answer = mr.finalAnswer;
-  } else {
-    answerSession.feedPrompt(`\n\nUser: ${modePrompt}\n\nQuestion: ${question.replace(/\n\n/g, '\n')}\nAssistant:\n`);
-    answer = answerSession.thinkGenerate(4096, GEN_OPTS).answer;
-  }
-
-  return {
-    content: [{
-      type: 'text',
-      text: `DEEP READ COMPLETE (coarse-to-fine)\nMode: ${mode} | Sections: ${chunks.length} | Relevant: [${targetIndices.join(', ')}]\n\n## Answer\n${answer}`,
-    }],
-  };
 }
 
-// === Tool 1: project_memory — 多级项目摘要 + State 持久化 ===
+// === Project Memory ===
 
 const STATES_DIR = join(process.env.HOME || '/tmp', '.rwkv-states');
 const DEFAULT_EXCLUDE = ['.git', 'node_modules', '__pycache__', '.DS_Store', 'target', 'dist', 'build', '.cache', '.claude', 'venv', '.venv'];
@@ -351,8 +466,7 @@ function loadProjectState(project) {
   return { state, meta };
 }
 
-async function projectSave(args) {
-  const { RwkvSession } = await import('./rwkv-binding.mjs');
+async function projectSave(args, ws, requestId) {
   const { project, path: rootPath, exclude = [], watch } = args;
   const effectiveProject = watch ? `watch-${project}` : project;
   const files = scanProject(rootPath, exclude);
@@ -361,18 +475,22 @@ async function projectSave(args) {
   const checksums = {};
   for (const f of files) checksums[relative(rootPath, f)] = fileChecksum(f);
 
-  // L3（文件级）：每个文件独立摘要
+  // L3: File-level summaries
   const l3Summaries = {};
   for (const f of files) {
     const rel = relative(rootPath, f);
     const content = readOneFile(rel, f, 100_000_000);
-    const s = new RwkvSession(model, tokenizer);
-    s.feedPrompt(content);
-    s.feedPrompt('\n\nUser: Summarize this file in 2-3 sentences: purpose, key exports, main logic.\nAssistant:\n');
-    l3Summaries[rel] = (await s.thinkGenerate(512, GEN_OPTS)).answer;
+    const { id: sid, session } = await sessionManager.create();
+    try {
+      await session.feedPrompt(content);
+      await session.feedPrompt('\n\nUser: Summarize this file in 2-3 sentences: purpose, key exports, main logic.\nAssistant:\n');
+      l3Summaries[rel] = await streamGenerate(session, 256, GEN_OPTS, ws, requestId);
+    } finally {
+      sessionManager.destroy(sid);
+    }
   }
 
-  // L2（模块级）：按目录分组摘要
+  // L2: Module-level summaries
   const dirs = {};
   for (const rel of Object.keys(l3Summaries)) {
     const dir = dirname(rel);
@@ -381,52 +499,68 @@ async function projectSave(args) {
   }
   const l2Summaries = {};
   for (const [dir, fileSums] of Object.entries(dirs)) {
-    const s = new RwkvSession(model, tokenizer);
-    s.feedPrompt(`Module [${dir}] contains these files:\n${fileSums.map((sum, i) => `- ${sum}`).join('\n')}`);
-    s.feedPrompt('\n\nUser: Summarize this module: purpose, responsibilities, key interfaces.\nAssistant:\n');
-    l2Summaries[dir] = (await s.thinkGenerate(512, GEN_OPTS)).answer;
-  }
-
-  // L1（项目级）：所有模块摘要 → 整体概述
-  const allL2 = Object.entries(l2Summaries).map(([dir, sum]) => `[${dir}]: ${sum}`).join('\n');
-  const l1Session = new RwkvSession(model, tokenizer);
-  l1Session.feedPrompt(`Project modules:\n${allL2}`);
-  l1Session.feedPrompt('\n\nUser: Describe the overall project architecture in 3-5 sentences: what it does, how it\'s organized, key design decisions.\nAssistant:\n');
-  const l1 = (await l1Session.thinkGenerate(512, GEN_OPTS)).answer;
-
-  // 全量 state：所有文件 feed → exportState
-  const fullSession = new RwkvSession(model, tokenizer);
-  const CHUNK = 262144;
-  for (const f of files) {
-    const content = readOneFile(relative(rootPath, f), f, 100_000_000);
-    for (let i = 0; i < content.length; i += CHUNK) {
-      let end = Math.min(i + CHUNK, content.length);
-      if (end < content.length) { const nl = content.lastIndexOf('\n', end); if (nl > i) end = nl + 1; }
-      fullSession.feedPrompt(content.slice(i, end));
+    const { id: sid, session } = await sessionManager.create();
+    try {
+      await session.feedPrompt(`Module [${dir}] contains these files:\n${fileSums.map((sum) => `- ${sum}`).join('\n')}`);
+      await session.feedPrompt('\n\nUser: Summarize this module: purpose, responsibilities, key interfaces.\nAssistant:\n');
+      l2Summaries[dir] = await streamGenerate(session, 256, GEN_OPTS, ws, requestId);
+    } finally {
+      sessionManager.destroy(sid);
     }
   }
-  const state = fullSession.exportState();
 
-  // 汇总 summary.md
-  const summary = `# ${project}\n\n## Overview (L1)\n${l1}\n\n## Modules (L2)\n${Object.entries(l2Summaries).map(([d, s]) => `### ${d}\n${s}`).join('\n\n')}\n\n## Files (L3)\n${Object.entries(l3Summaries).map(([f, s]) => `### ${f}\n${s}`).join('\n\n')}\n`;
+  // L1: Project overview
+  const allL2 = Object.entries(l2Summaries).map(([dir, sum]) => `[${dir}]: ${sum}`).join('\n');
+  const { id: l1Id, session: l1Session } = await sessionManager.create();
+  try {
+    await l1Session.feedPrompt(`Project modules:\n${allL2}`);
+    await l1Session.feedPrompt('\n\nUser: Describe the overall project architecture in 3-5 sentences: what it does, how it\'s organized, key design decisions.\nAssistant:\n');
+    const l1 = await streamGenerate(l1Session, 256, GEN_OPTS, ws, requestId);
 
-  const meta = { project: effectiveProject, path: rootPath, files: Object.keys(checksums), checksums, fileCount: files.length, watch: !!watch, createdAt: Date.now(), updatedAt: Date.now() };
-  saveProjectState(effectiveProject, state, meta, summary);
+    // Full state: feed all files
+    const { id: fullId, session: fullSession } = await sessionManager.create();
+    sessionManager.pin(fullId);
+    try {
+      const CHUNK = 262144;
+      for (const f of files) {
+        const content = readOneFile(relative(rootPath, f), f, 100_000_000);
+        for (let i = 0; i < content.length; i += CHUNK) {
+          let end = Math.min(i + CHUNK, content.length);
+          if (end < content.length) { const nl = content.lastIndexOf('\n', end); if (nl > i) end = nl + 1; }
+          await fullSession.feedPrompt(content.slice(i, end));
+        }
+      }
+      const state = await fullSession.exportState();
 
-  const label = watch ? `WATCH BASELINE: ${project}` : `PROJECT SAVED: ${project}`;
-  return { content: [{ type: 'text', text: `${label}\nFiles: ${files.length} | Modules: ${Object.keys(l2Summaries).length}\n\n## Overview\n${l1}` }] };
+      const summary = `# ${project}\n\n## Overview (L1)\n${l1}\n\n## Modules (L2)\n${Object.entries(l2Summaries).map(([d, s]) => `### ${d}\n${s}`).join('\n\n')}\n\n## Files (L3)\n${Object.entries(l3Summaries).map(([f, s]) => `### ${f}\n${s}`).join('\n\n')}\n`;
+      const meta = { project: effectiveProject, path: rootPath, files: Object.keys(checksums), checksums, fileCount: files.length, watch: !!watch, createdAt: Date.now(), updatedAt: Date.now() };
+      saveProjectState(effectiveProject, state, meta, summary);
+
+      const label = watch ? `WATCH BASELINE: ${project}` : `PROJECT SAVED: ${project}`;
+      return { content: [{ type: 'text', text: `${label}\nFiles: ${files.length} | Modules: ${Object.keys(l2Summaries).length}\n\n## Overview\n${l1}` }] };
+    } finally {
+      sessionManager.unpin(fullId);
+      sessionManager.destroy(fullId);
+    }
+  } finally {
+    sessionManager.destroy(l1Id);
+  }
 }
 
-async function projectQuery(args) {
-  const { RwkvSession } = await import('./rwkv-binding.mjs');
+async function projectQuery(args, ws, requestId) {
   const loaded = loadProjectState(args.project);
   if (!loaded) return { content: [{ type: 'text', text: `PROJECT QUERY: "${args.project}" not found. Use project_save first.` }] };
 
-  const session = new RwkvSession(model, tokenizer);
-  session.importState(loaded.state);
-  const mr = await session.multiRoundThink(args.question.replace(/\n\n/g, '\n'), DEEP_THINK);
-
-  return { content: [{ type: 'text', text: `PROJECT QUERY: ${args.project}\nRounds: ${mr.totalRounds} | Converged: ${mr.converged}\n\n## Answer\n${mr.finalAnswer}` }] };
+  const { id: sid, session } = await sessionManager.create();
+  sessionManager.pin(sid);
+  try {
+    await session.importState(loaded.state);
+    const mr = await streamMultiRoundThink(session, args.question.replace(/\n\n/g, '\n'), DEEP_THINK, ws, requestId);
+    return { content: [{ type: 'text', text: `PROJECT QUERY: ${args.project}\nRounds: ${mr.totalRounds} | Converged: ${mr.converged}\n\n## Answer\n${mr.finalAnswer}` }] };
+  } finally {
+    sessionManager.unpin(sid);
+    sessionManager.destroy(sid);
+  }
 }
 
 function projectList() {
@@ -445,7 +579,7 @@ function projectList() {
   return { content: [{ type: 'text', text: `Saved Projects:\n${lines.join('\n')}` }] };
 }
 
-// === Tool 2: multi_lens — 多视角并行分析 ===
+// === Multi Lens ===
 
 const LENS_PROMPTS = {
   security: 'Analyze from a SECURITY perspective: vulnerabilities, attack surfaces, auth issues, data exposure, OWASP risks.',
@@ -455,96 +589,127 @@ const LENS_PROMPTS = {
   reliability: 'Analyze from a RELIABILITY perspective: error handling, fault tolerance, recovery, monitoring, edge cases.',
 };
 
-async function multiLens(args) {
-  const { RwkvSession } = await import('./rwkv-binding.mjs');
+async function multiLens(args, ws, requestId) {
   const { files, question, lenses = ['security', 'performance', 'architecture'], extraLens, cwd } = args;
-
   const content = readFilesAsContext(files, cwd, 100_000_000);
 
-  // 共享 baseState
-  const baseSession = new RwkvSession(model, tokenizer);
-  baseSession.feedPrompt(content);
-  const baseState = baseSession.exportState();
+  const { id: baseId, session: baseSession } = await sessionManager.create();
+  sessionManager.pin(baseId);
+  try {
+    await baseSession.feedPrompt(content);
+    const baseState = await baseSession.exportState();
 
-  // 每个视角独立分析
-  const perspectives = [];
-  for (const lens of lenses) {
-    const s = new RwkvSession(model, tokenizer);
-    s.importState(baseState);
-    s.feedPrompt(`\n\nUser: ${LENS_PROMPTS[lens] || lens}\n\nQuestion: ${question}\nAssistant:\n`);
-    const { answer } = await s.thinkGenerate(2048, GEN_OPTS);
-    perspectives.push({ lens, answer });
+    const perspectives = [];
+    for (const lens of lenses) {
+      const { id: lid, session } = await sessionManager.create();
+      sessionManager.pin(lid);
+      try {
+        await session.importState(baseState);
+        await session.feedPrompt(`\n\nUser: ${LENS_PROMPTS[lens] || lens}\n\nQuestion: ${question}\nAssistant:\n`);
+        const { answer } = await streamThinkGenerate(session, 2048, GEN_OPTS, ws, requestId);
+        perspectives.push({ lens, answer });
+      } finally {
+        sessionManager.unpin(lid);
+        sessionManager.destroy(lid);
+      }
+    }
+
+    if (extraLens) {
+      const { id: lid, session } = await sessionManager.create();
+      sessionManager.pin(lid);
+      try {
+        await session.importState(baseState);
+        await session.feedPrompt(`\n\nUser: ${extraLens}\n\nQuestion: ${question}\nAssistant:\n`);
+        perspectives.push({ lens: 'custom', answer: (await streamThinkGenerate(session, 2048, GEN_OPTS, ws, requestId)).answer });
+      } finally {
+        sessionManager.unpin(lid);
+        sessionManager.destroy(lid);
+      }
+    }
+
+    const { id: synthId, session: synthSession } = await sessionManager.create();
+    sessionManager.pin(synthId);
+    try {
+      await synthSession.importState(baseState);
+      const allPerspectives = perspectives.map(p => `[${p.lens}]: ${p.answer}`).join('\n\n');
+      const synthResult = await streamMultiRoundThink(
+        synthSession,
+        `Cross-analyze these perspectives on "${question}":\n${allPerspectives}\n\nIdentify contradictions, trade-offs, and unified recommendations.`,
+        DEEP_THINK, ws, requestId
+      );
+
+      const out = [`MULTI-LENS ANALYSIS`, `Lenses: ${perspectives.map(p => p.lens).join(', ')}`, ''];
+      for (const p of perspectives) { out.push(`## ${p.lens}`); out.push(p.answer); out.push(''); }
+      out.push('## Synthesis'); out.push(synthResult.finalAnswer);
+
+      return { content: [{ type: 'text', text: out.join('\n') }] };
+    } finally {
+      sessionManager.unpin(synthId);
+      sessionManager.destroy(synthId);
+    }
+  } finally {
+    sessionManager.unpin(baseId);
+    sessionManager.destroy(baseId);
   }
-
-  // 自定义视角
-  if (extraLens) {
-    const s = new RwkvSession(model, tokenizer);
-    s.importState(baseState);
-    s.feedPrompt(`\n\nUser: ${extraLens}\n\nQuestion: ${question}\nAssistant:\n`);
-    perspectives.push({ lens: 'custom', answer: (await s.thinkGenerate(2048, GEN_OPTS)).answer });
-  }
-
-  // 汇总：交叉对比（多轮 Think — 多视角交叉是复杂推理）
-  const synthSession = new RwkvSession(model, tokenizer);
-  synthSession.importState(baseState);
-  const allPerspectives = perspectives.map(p => `[${p.lens}]: ${p.answer}`).join('\n\n');
-  const synthResult = await synthSession.multiRoundThink(
-    `Cross-analyze these perspectives on "${question}":\n${allPerspectives}\n\nIdentify contradictions, trade-offs, and unified recommendations.`,
-    DEEP_THINK
-  );
-  const synthesis = synthResult.finalAnswer;
-
-  const out = [`MULTI-LENS ANALYSIS`, `Lenses: ${perspectives.map(p => p.lens).join(', ')}`, ''];
-  for (const p of perspectives) { out.push(`## ${p.lens}`); out.push(p.answer); out.push(''); }
-  out.push('## Synthesis'); out.push(synthesis);
-
-  return { content: [{ type: 'text', text: out.join('\n') }] };
 }
 
-// === Tool 3: diff_read — 长文本对比 ===
+// === Diff Read ===
 
-async function diffRead(args) {
-  const { RwkvSession } = await import('./rwkv-binding.mjs');
+async function diffRead(args, ws, requestId) {
   const { filesA, filesB, question, labelA = 'A', labelB = 'B', cwd } = args;
-
   const contentA = readFilesAsContext(filesA, cwd, 100_000_000);
   const contentB = readFilesAsContext(filesB, cwd, 100_000_000);
 
-  // 两路独立摘要
-  const sA = new RwkvSession(model, tokenizer);
-  sA.feedPrompt(contentA);
-  sA.feedPrompt('\n\nUser: Describe the structure, key components, and main logic of this codebase.\nAssistant:\n');
-  const summaryA = (await sA.thinkGenerate(2048, GEN_OPTS)).answer;
+  const { id: aId, session: sA } = await sessionManager.create();
+  sessionManager.pin(aId);
+  try {
+    await sA.feedPrompt(contentA);
+    await sA.feedPrompt('\n\nUser: Describe the structure, key components, and main logic of this codebase.\nAssistant:\n');
+    const summaryA = await streamGenerate(sA, 1024, GEN_OPTS, ws, requestId);
 
-  const sB = new RwkvSession(model, tokenizer);
-  sB.feedPrompt(contentB);
-  sB.feedPrompt('\n\nUser: Describe the structure, key components, and main logic of this codebase.\nAssistant:\n');
-  const summaryB = (await sB.thinkGenerate(2048, GEN_OPTS)).answer;
+    const { id: bId, session: sB } = await sessionManager.create();
+    sessionManager.pin(bId);
+    try {
+      await sB.feedPrompt(contentB);
+      await sB.feedPrompt('\n\nUser: Describe the structure, key components, and main logic of this codebase.\nAssistant:\n');
+      const summaryB = await streamGenerate(sB, 1024, GEN_OPTS, ws, requestId);
 
-  // 对比分析（多轮 Think — 差异对比需要深度推理）
-  const sC = new RwkvSession(model, tokenizer);
-  const diffResult = await sC.multiRoundThink(
-    `Compare these two versions:\n\n[${labelA}]:\n${summaryA}\n\n[${labelB}]:\n${summaryB}\n\nQuestion: ${question}`,
-    DEEP_THINK
-  );
-  const diff = diffResult.finalAnswer;
+      const { id: cId, session: sC } = await sessionManager.create();
+      sessionManager.pin(cId);
+      try {
+        const diffResult = await streamMultiRoundThink(
+          sC,
+          `Compare these two versions:\n\n[${labelA}]:\n${summaryA}\n\n[${labelB}]:\n${summaryB}\n\nQuestion: ${question}`,
+          DEEP_THINK, ws, requestId
+        );
 
-  return { content: [{ type: 'text', text: `DIFF ANALYSIS: ${labelA} vs ${labelB}\n\n## ${labelA} Summary\n${summaryA}\n\n## ${labelB} Summary\n${summaryB}\n\n## Diff: ${question}\n${diff}` }] };
+        return { content: [{ type: 'text', text: `DIFF ANALYSIS: ${labelA} vs ${labelB}\n\n## ${labelA} Summary\n${summaryA}\n\n## ${labelB} Summary\n${summaryB}\n\n## Diff: ${question}\n${diffResult.finalAnswer}` }] };
+      } finally {
+        sessionManager.unpin(cId);
+        sessionManager.destroy(cId);
+      }
+    } finally {
+      sessionManager.unpin(bId);
+      sessionManager.destroy(bId);
+    }
+  } finally {
+    sessionManager.unpin(aId);
+    sessionManager.destroy(aId);
+  }
 }
 
-// === Tool 4: watch_analyze — 增量监控（≥10min 间隔，仅闲时） ===
+// === Watch Check ===
 
-const WATCH_MIN_INTERVAL = 10 * 60 * 1000; // 10 minutes
+const WATCH_MIN_INTERVAL = 10 * 60 * 1000;
 let serverBusy = false;
 
-async function watchCheck(args) {
+async function watchCheck(args, ws, requestId) {
   const { project, question = 'Analyze the recent changes' } = args;
   const watchProject = `watch-${project}`;
 
   const loaded = loadProjectState(watchProject);
   if (!loaded) return { content: [{ type: 'text', text: `WATCH CHECK: "${project}" not set up. Use project_save with watch=true first.` }] };
 
-  // 间隔检查（含状态信息 — 吸收原 watch_status）
   const elapsed = Date.now() - loaded.meta.updatedAt;
   const statusLine = `Files: ${loaded.meta.files.length} | Last check: ${(elapsed / 60000).toFixed(1)}min ago`;
 
@@ -555,11 +720,8 @@ async function watchCheck(args) {
 
   if (serverBusy) return { content: [{ type: 'text', text: `WATCH CHECK: Server busy, try later.\n${statusLine}` }] };
 
-  const { RwkvSession } = await import('./rwkv-binding.mjs');
-
   serverBusy = true;
   try {
-    // 计算当前 checksums
     const currentChecksums = {};
     const changedFiles = [];
     const newFiles = [];
@@ -572,7 +734,6 @@ async function watchCheck(args) {
       if (currentChecksums[rel] !== loaded.meta.checksums[rel]) changedFiles.push(rel);
     }
 
-    // 检测新文件
     const currentFiles = scanProject(rootPath);
     for (const f of currentFiles) {
       const rel = relative(rootPath, f);
@@ -582,136 +743,231 @@ async function watchCheck(args) {
     const allChanged = [...changedFiles, ...newFiles];
     if (!allChanged.length) return { content: [{ type: 'text', text: 'WATCH CHECK: No changes detected.' }] };
 
-    // 增量分析：加载 baseline state → feed 变更内容 → Think mode
-    const session = new RwkvSession(model, tokenizer);
-    session.importState(loaded.state);
+    const { id: sid, session } = await sessionManager.create();
+    sessionManager.pin(sid);
+    try {
+      await session.importState(loaded.state);
+      const changeContent = allChanged.map(rel => {
+        const abs = join(rootPath, rel);
+        return readOneFile(rel, abs, 100_000_000);
+      }).join('\n\n');
 
-    const changeContent = allChanged.map(rel => {
-      const abs = join(rootPath, rel);
-      return readOneFile(rel, abs, 100_000_000);
-    }).join('\n\n');
+      await session.feedPrompt(`\n\nUpdated files:\n${changeContent}`);
+      await session.feedPrompt(`\n\nUser: ${question}\n\nChanged files: ${allChanged.join(', ')}\nAssistant:\n`);
+      const { answer } = await streamThinkGenerate(session, 4096, GEN_OPTS, ws, requestId);
 
-    session.feedPrompt(`\n\nUpdated files:\n${changeContent}`);
-    session.feedPrompt(`\n\nUser: ${question}\n\nChanged files: ${allChanged.join(', ')}\nAssistant:\n`);
-    const { answer } = await session.thinkGenerate(4096, GEN_OPTS);
+      const newState = await session.exportState();
+      loaded.meta.checksums = currentChecksums;
+      loaded.meta.updatedAt = Date.now();
+      saveProjectState(watchProject, newState, loaded.meta, `# Watch: ${project}\nLast check: ${new Date().toISOString()}\n`);
 
-    // 更新 state 和 meta
-    const newState = session.exportState();
-    loaded.meta.checksums = currentChecksums;
-    loaded.meta.updatedAt = Date.now();
-    saveProjectState(watchProject, newState, loaded.meta, `# Watch: ${project}\nLast check: ${new Date().toISOString()}\n`);
-
-    return { content: [{ type: 'text', text: `WATCH CHECK: ${project}\nChanged: ${allChanged.length} files (${changedFiles.length} modified, ${newFiles.length} new)\n\n## Analysis\n${answer}` }] };
+      return { content: [{ type: 'text', text: `WATCH CHECK: ${project}\nChanged: ${allChanged.length} files (${changedFiles.length} modified, ${newFiles.length} new)\n\n## Analysis\n${answer}` }] };
+    } finally {
+      sessionManager.unpin(sid);
+      sessionManager.destroy(sid);
+    }
   } finally {
     serverBusy = false;
   }
 }
 
-// === HTTP 服务 ===
+// === WS 消息路由 ===
+
+const TOOL_MAP = {
+  'execute-dag': executeDAG,
+  'deep-read': deepRead,
+  'project-save': projectSave,
+  'project-query': projectQuery,
+  'project-list': projectList,
+  'multi-lens': multiLens,
+  'diff-read': diffRead,
+  'watch-check': watchCheck,
+};
+
+function handleConnection(ws) {
+  const connectionSessions = new Set();
+
+  ws.on('close', () => {
+    model.abort();
+    sessionManager.abortAll();
+    // Repeatedly abort+destroy until all sessions cleaned up
+    const cleanup = setInterval(() => {
+      model.abort();
+      sessionManager.abortAll();
+      sessionManager.destroyAll();
+      if (sessionManager.size === 0) {
+        clearInterval(cleanup);
+      }
+    }, 500);
+    setTimeout(() => clearInterval(cleanup), 30000);
+  });
+
+  ws.on('message', async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { wsSend(ws, { type: 'error', message: 'Invalid JSON' }); return; }
+
+    const { requestId, type } = msg;
+
+    try {
+      switch (type) {
+        case 'session.create': {
+          const { id } = await sessionManager.create();
+          connectionSessions.add(id);
+          wsSend(ws, { requestId, type: 'session.created', sessionId: id });
+          break;
+        }
+
+        case 'session.feedPrompt': {
+          const session = sessionManager.get(msg.sessionId);
+          if (!session) { wsSend(ws, { requestId, type: 'error', message: `Session ${msg.sessionId} not found` }); break; }
+          await session.feedPrompt(msg.text);
+          wsSend(ws, { requestId, type: 'session.promptFed', sessionId: msg.sessionId });
+          break;
+        }
+
+        case 'session.feedChatPrompt': {
+          const session = sessionManager.get(msg.sessionId);
+          if (!session) { wsSend(ws, { requestId, type: 'error', message: `Session ${msg.sessionId} not found` }); break; }
+          await session.feedChatPrompt(msg.text, msg.options || {});
+          wsSend(ws, { requestId, type: 'session.promptFed', sessionId: msg.sessionId });
+          break;
+        }
+
+        case 'session.generate': {
+          const session = sessionManager.get(msg.sessionId);
+          if (!session) { wsSend(ws, { requestId, type: 'error', message: `Session ${msg.sessionId} not found` }); break; }
+          const text = await streamGenerate(session, msg.maxTokens || 512, msg.options || {}, ws, requestId);
+          wsSend(ws, { requestId, type: 'generate.done', sessionId: msg.sessionId, text, tokenCount: session.tokenCount });
+          break;
+        }
+
+        case 'session.thinkGenerate': {
+          const session = sessionManager.get(msg.sessionId);
+          if (!session) { wsSend(ws, { requestId, type: 'error', message: `Session ${msg.sessionId} not found` }); break; }
+          const result = await streamThinkGenerate(session, msg.maxAnswerTokens || 2048, msg.options || {}, ws, requestId);
+          wsSend(ws, { requestId, type: 'thinkGenerate.done', sessionId: msg.sessionId, ...result });
+          break;
+        }
+
+        case 'session.multiRoundThink': {
+          const session = sessionManager.get(msg.sessionId);
+          if (!session) { wsSend(ws, { requestId, type: 'error', message: `Session ${msg.sessionId} not found` }); break; }
+          const mr = await streamMultiRoundThink(session, msg.prompt, msg.options || {}, ws, requestId);
+          wsSend(ws, { requestId, type: 'multiRoundThink.done', sessionId: msg.sessionId, ...mr });
+          break;
+        }
+
+        case 'session.exportState': {
+          const session = sessionManager.get(msg.sessionId);
+          if (!session) { wsSend(ws, { requestId, type: 'error', message: `Session ${msg.sessionId} not found` }); break; }
+          const state = await session.exportState();
+          const copy = new Float32Array(state);
+          const buf = Buffer.from(copy.buffer, copy.byteOffset, copy.byteLength);
+          wsSend(ws, { requestId, type: 'state.exported', sessionId: msg.sessionId, stateB64: buf.toString('base64') });
+          break;
+        }
+
+        case 'session.importState': {
+          const session = sessionManager.get(msg.sessionId);
+          if (!session) { wsSend(ws, { requestId, type: 'error', message: `Session ${msg.sessionId} not found` }); break; }
+          const buf = Buffer.from(msg.stateB64, 'base64');
+          const state = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+          await session.importState(state);
+          wsSend(ws, { requestId, type: 'state.imported', sessionId: msg.sessionId });
+          break;
+        }
+
+        case 'session.pin': {
+          sessionManager.pin(msg.sessionId);
+          wsSend(ws, { requestId, type: 'session.pinned', sessionId: msg.sessionId });
+          break;
+        }
+
+        case 'session.unpin': {
+          sessionManager.unpin(msg.sessionId);
+          wsSend(ws, { requestId, type: 'session.unpinned', sessionId: msg.sessionId });
+          break;
+        }
+
+        case 'session.destroy': {
+          sessionManager.unpin(msg.sessionId);
+          sessionManager.destroy(msg.sessionId);
+          connectionSessions.delete(msg.sessionId);
+          wsSend(ws, { requestId, type: 'session.destroyed', sessionId: msg.sessionId });
+          break;
+        }
+
+        case 'tool.execute': {
+          modelHealth.totalRequests++;
+          const handler = TOOL_MAP[msg.tool];
+          if (!handler) { wsSend(ws, { requestId, type: 'error', message: `Unknown tool: ${msg.tool}` }); break; }
+          const isNoArgs = msg.tool === 'project-list';
+          const TOOL_TIMEOUT = parseInt(process.env.RWKV_TOOL_TIMEOUT || '1800000', 10);
+          const result = await Promise.race([
+            handler(isNoArgs ? {} : (msg.args || {}), ws, requestId),
+            new Promise((_, reject) => setTimeout(() => reject(new Error(`Tool "${msg.tool}" execution timeout (${TOOL_TIMEOUT}ms)`)), TOOL_TIMEOUT)),
+          ]);
+          wsSend(ws, { requestId, type: 'tool.result', tool: msg.tool, ...result });
+          break;
+        }
+
+        default:
+          wsSend(ws, { requestId, type: 'error', message: `Unknown message type: ${type}` });
+      }
+    } catch (err) {
+      modelHealth.errorCount++;
+      modelHealth.lastError = { message: err.message, time: Date.now() };
+      wsSend(ws, {
+        requestId,
+        type: 'error',
+        message: `${err.message}\n${err.stack?.split('\n').slice(0, 5).join('\n')}`,
+      });
+    }
+  });
+}
+
+// === 服务器启动 ===
 
 const PORT = parseInt(process.env.RWKV_SERVER_PORT || '19876', 10);
 const PID_FILE = join(process.env.HOME || '/tmp', '.rwkv-server.json');
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', c => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
-    req.on('error', reject);
-  });
-}
-
-const server = http.createServer(async (req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200);
-    res.end(JSON.stringify({ status: 'ok', model: model ? 'loaded' : 'not_loaded' }));
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/execute-dag') {
-    try {
-      const body = await readBody(req);
-      const args = JSON.parse(body);
-      const result = await executeDAG(args);
-      res.writeHead(200);
-      res.end(JSON.stringify(result));
-    } catch (err) {
-      res.writeHead(500);
-      res.end(JSON.stringify({
-        content: [{ type: 'text', text: `RWKV SERVER ERROR: ${err.message}\n${err.stack?.split('\n').slice(0, 5).join('\n')}` }],
-      }));
-    }
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/deep-read') {
-    try {
-      const body = await readBody(req);
-      const args = JSON.parse(body);
-      const result = await deepRead(args);
-      res.writeHead(200);
-      res.end(JSON.stringify(result));
-    } catch (err) {
-      res.writeHead(500);
-      res.end(JSON.stringify({
-        content: [{ type: 'text', text: `DEEP READ ERROR: ${err.message}\n${err.stack?.split('\n').slice(0, 5).join('\n')}` }],
-      }));
-    }
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/project-save') {
-    try { const args = JSON.parse(await readBody(req)); res.writeHead(200); res.end(JSON.stringify(await projectSave(args))); }
-    catch (err) { res.writeHead(500); res.end(JSON.stringify({ content: [{ type: 'text', text: `ERROR: ${err.message}` }] })); }
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/project-query') {
-    try { const args = JSON.parse(await readBody(req)); res.writeHead(200); res.end(JSON.stringify(await projectQuery(args))); }
-    catch (err) { res.writeHead(500); res.end(JSON.stringify({ content: [{ type: 'text', text: `ERROR: ${err.message}` }] })); }
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/project-list') {
-    try { res.writeHead(200); res.end(JSON.stringify(projectList())); }
-    catch (err) { res.writeHead(500); res.end(JSON.stringify({ content: [{ type: 'text', text: `ERROR: ${err.message}` }] })); }
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/multi-lens') {
-    try { const args = JSON.parse(await readBody(req)); res.writeHead(200); res.end(JSON.stringify(await multiLens(args))); }
-    catch (err) { res.writeHead(500); res.end(JSON.stringify({ content: [{ type: 'text', text: `ERROR: ${err.message}` }] })); }
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/diff-read') {
-    try { const args = JSON.parse(await readBody(req)); res.writeHead(200); res.end(JSON.stringify(await diffRead(args))); }
-    catch (err) { res.writeHead(500); res.end(JSON.stringify({ content: [{ type: 'text', text: `ERROR: ${err.message}` }] })); }
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/watch-check') {
-    try { const args = JSON.parse(await readBody(req)); res.writeHead(200); res.end(JSON.stringify(await watchCheck(args))); }
-    catch (err) { res.writeHead(500); res.end(JSON.stringify({ content: [{ type: 'text', text: `ERROR: ${err.message}` }] })); }
-    return;
-  }
-
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: 'Not found' }));
-});
-
-// === 启动 ===
-
 async function main() {
   console.error('[rwkv-server] Loading RWKV model...');
   await loadModel();
-  console.error('[rwkv-server] Model loaded successfully.');
+  sessionManager = new SessionManager(model, tokenizer);
+  console.error('[rwkv-server] Model loaded. SessionManager ready.');
 
-  server.listen(PORT, '127.0.0.1', () => {
-    writeFileSync(PID_FILE, JSON.stringify({ pid: process.pid, port: PORT, startedAt: Date.now() }));
-    console.error(`[rwkv-server] Listening on 127.0.0.1:${PORT}`);
+  const httpServer = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.method === 'GET' && req.url === '/health') {
+      const uptime = modelHealth.loadTime ? ((Date.now() - modelHealth.loadTime) / 1000).toFixed(0) : '0';
+      const memUsage = process.memoryUsage();
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        status: 'ok',
+        model: model ? 'loaded' : 'not_loaded',
+        uptime: `${uptime}s`,
+        memory: { rss: `${(memUsage.rss / 1024 / 1024).toFixed(0)}MB`, heapUsed: `${(memUsage.heapUsed / 1024 / 1024).toFixed(0)}MB` },
+        requests: modelHealth.totalRequests,
+        errors: modelHealth.errorCount,
+        sessions: sessionManager.size,
+        busy: serverBusy,
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: 'Not found. Use WebSocket on /ws.' }));
+  });
+
+  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+  wss.on('connection', (ws) => {
+    console.error('[rwkv-server] WS client connected');
+    handleConnection(ws);
+  });
+
+  httpServer.listen(PORT, process.env.RWKV_LISTEN_ADDR || '127.0.0.1', () => {
+    writeFileSync(PID_FILE, JSON.stringify({ pid: process.pid, port: PORT, startedAt: Date.now(), protocol: 'ws' }));
+    console.error(`[rwkv-server] Listening on 127.0.0.1:${PORT} (WS on /ws, HTTP /health)`);
   });
 }
 
@@ -720,19 +976,14 @@ main().catch(err => {
   process.exit(1);
 });
 
-// 优雅关闭
 process.on('SIGTERM', () => {
   console.error('[rwkv-server] SIGTERM received, shutting down...');
-  server.close(() => {
-    try { require('fs').unlinkSync(PID_FILE); } catch {}
-    process.exit(0);
-  });
+  sessionManager.destroyAll();
+  process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.error('[rwkv-server] SIGINT received, shutting down...');
-  server.close(() => {
-    try { require('fs').unlinkSync(PID_FILE); } catch {}
-    process.exit(0);
-  });
+  sessionManager.destroyAll();
+  process.exit(0);
 });
