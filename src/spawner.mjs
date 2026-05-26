@@ -560,8 +560,18 @@ async function workerDispatch(args) {
         batch.map((id) => {
           const task = taskMap.get(id);
           const idx = extIdx++;
+          // 伪 FORK：仅在单依赖链上启用，merge 节点回退纯 text injection
+          // fan-out（A→B,C）安全：每次 forkSession 创建独立副本
+          // fan-in（B,C→D）禁用 fork：D 只取一个上游会话会丢失其他上游上下文
+          let forkSession = null;
+          if ((task.dependsOn || []).length === 1) {
+            const dep = resultMap.get(task.dependsOn[0]);
+            if (dep?.success && dep.sessionId) forkSession = dep.sessionId;
+          }
+          // fork 时跳过 fork 源的 text injection（已存在于对话历史中），避免重复
+          const skipInject = forkSession ? task.dependsOn[0] : null;
           const upstreamResults = (task.dependsOn || [])
-            .filter(depId => resultMap.has(depId) && resultMap.get(depId).success)
+            .filter(depId => depId !== skipInject && resultMap.has(depId) && resultMap.get(depId).success)
             .map(depId => {
               const dep = resultMap.get(depId);
               return {
@@ -571,15 +581,6 @@ async function workerDispatch(args) {
                 context: taskMap.get(depId)?.context || null,
               };
             });
-          // 选择 fork 源：上游同引擎最近成功的 session
-          let forkSession = null;
-          for (const depId of (task.dependsOn || [])) {
-            const dep = resultMap.get(depId);
-            if (dep?.success && dep.sessionId) {
-              forkSession = dep.sessionId;
-              break;
-            }
-          }
           if (isPro) {
             if (idx < PRO_GLM_LIMIT) {
               return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, loadGlmEnv(), mode, WORKER_MODELS.proGlm, upstreamResults, true, forkSession);
