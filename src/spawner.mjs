@@ -429,7 +429,7 @@ async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, up
     const opts = {
       systemPrompt: [isPro ? WORKER_SYSTEM_PRO : WORKER_SYSTEM_FAST, SYSTEM_PROMPT_DYNAMIC_BOUNDARY],
       cwd: task.cwd || baseCwd || process.cwd(),
-      maxTurns: task.maxTurns || (isPro ? 50 : 20),
+      maxTurns: task.maxTurns,
       permissionMode: 'bypassPermissions',
       allowedTools: isPro ? ALL_TOOLS : WORKER_TOOLS,
       model: model || WORKER_MODELS.fast,
