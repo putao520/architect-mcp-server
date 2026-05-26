@@ -245,19 +245,16 @@ const WORKER_TOOLS = [
   'mcp__lsp-tools__lsp_document_symbols', 'mcp__lsp-tools__lsp_implementations',
 ];
 
-const WORKER_SYSTEM_FAST = `
-你是机械化任务执行器。严格按指令执行，不做设计决策。
-- 不在要求时添加注释或文档
-- 遇到歧义按最简方案处理
-- 不修改指令未提及的文件
-- 最后必须输出 JSON 结果块，格式见任务指令`;
+const WORKER_SYSTEM_FAST = `你是机械化任务执行器。
+- 读文件用 Read，编辑用 Edit，搜索用 Grep/Glob，命令用 Bash
+- 不加注释/文档，不解释，只输出变更摘要
+- 不修改指令未提及的文件`;
 
-const WORKER_SYSTEM_PRO = `
-你是高级任务执行器，具备代码理解和独立判断能力。
-- 理解任务意图，选择最优实现路径
-- 遇到歧义时基于上下文做合理推断，必要时主动搜索代码库获取信息
-- 确保实现符合项目既有架构模式和编码规范
-- 最后必须输出 JSON 结果块，格式见任务指令`;
+const WORKER_SYSTEM_PRO = `你是高级任务执行器。
+- 读文件用 Read，编辑用 Edit，搜索用 Grep/Glob，命令用 Bash
+- 可用 LSP 工具做语义查询（hover/references/implementations/document_symbols）
+- 理解任务意图，选最优路径，遵循项目既有规范
+- 必要时用 WebSearch 查资料`;
 
 const WORKER_MODELS = {
   fast: 'deepseek-v4-flash[1m]',
@@ -384,12 +381,10 @@ function buildPrompt(task, upstreamResults, isDag) {
 }
 
 async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, upstreamResults = null, isDag = false) {
-  const messages = [];
   let finalResult = null;
   const isPro = mode === 'pro';
   const isGlm = model === WORKER_MODELS.proGlm;
   const isXf = model === WORKER_MODELS.fastXf;
-  const isExternal = isGlm || isXf;
   const prompt = buildPrompt(task, upstreamResults, isDag);
 
   if (isGlm) await glmSem.acquire();
@@ -398,21 +393,17 @@ async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, up
     for await (const message of query({
       prompt,
       options: {
-        systemPrompt: { type: 'preset', preset: 'claude_code', append: isPro ? WORKER_SYSTEM_PRO : WORKER_SYSTEM_FAST },
+        systemPrompt: { type: 'text', text: isPro ? WORKER_SYSTEM_PRO : WORKER_SYSTEM_FAST },
         cwd: task.cwd || baseCwd || process.cwd(),
-        maxTurns: task.maxTurns || (isPro ? 200 : 100),
+        maxTurns: task.maxTurns || (isPro ? 50 : 20),
         permissionMode: 'bypassPermissions',
         allowedTools: isPro ? ALL_TOOLS : WORKER_TOOLS,
         model: model || WORKER_MODELS[mode],
-        effort: isPro ? 'medium' : 'low',
+        effort: isPro ? 'low' : 'low',
         env,
       },
     })) {
-      if (message.type === 'assistant' && message.message?.content) {
-        for (const block of message.message.content) {
-          if ('text' in block && block.text) messages.push(block.text);
-        }
-      } else if (message.type === 'result') {
+      if (message.type === 'result') {
         finalResult = message;
       }
     }
@@ -425,9 +416,9 @@ async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, up
   else if (isXf) xfSem.release();
 
   const success = finalResult?.subtype === 'success';
-  const raw = finalResult?.result || messages.join('\n');
+  const raw = finalResult?.result || '(no output)';
   const { summary, output } = isDag ? extractResultJson(raw) : { summary: '', output: null };
-  return { id: task.id, success, result: raw.slice(0, 4000), summary, output };
+  return { id: task.id, success, result: raw.slice(0, 2000), summary, output };
 }
 
 async function workerDispatch(args) {
