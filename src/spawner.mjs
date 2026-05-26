@@ -874,28 +874,41 @@ export function registerTools(server, env) {
   //
   // 原始注册代码见 git history
 
-  // === Tool 4: worker_dispatch — 高并发任务集群 ===
+  // === Tool 4: worker_dispatch — 高并发批量任务执行器 ===
 
   server.tool(
     'worker_dispatch',
-    `高并发任务集群，支持 DAG 依赖调度。无依赖的任务并行，有依赖的任务串行等待。上游失败则下游跳过。task 内 steps 串行共享上下文。`,
+    `批量机械化任务执行器。仅用于 3+ 个同模式任务的并行批处理。这不是子 Agent，worker 没有架构判断能力。
+
+【适用场景】必须同时满足：任务数≥3 + 每个任务指令明确无歧义 + 不需要架构决策
+- fast：批量重命名、import整理、格式化、死代码清理、find-replace、console.log清除、测试桩生成
+- pro：需 LSP 查引用后决策的重构、涉及类型推断的类型注解、需理解语义的跨文件修改
+
+【禁止场景】
+- 任务数<3 → 直接在主会话执行，不要 dispatch
+- 需要架构设计/方案选择 → 主会话或 architect
+- 复杂 bug 诊断 → debugger
+- 需要来回确认/澄清的任务 → 主会话
+- 把它当"能干活的子 Agent"随意扔单个任务 → 成本浪费
+
+【DAG】dependsOn 声明依赖，上游失败下游跳过。上游输出自动注入下游 prompt。`,
     {
       tasks: z.array(z.object({
         id: z.string().describe('任务标识（如 "rename-auth", "add-types"）'),
-        description: z.string().describe('任务描述（给 worker 的完整指令，要足够具体）。与 steps 二选一'),
+        description: z.string().describe('给 worker 的完整指令，必须足够具体到可以直接执行。与 steps 二选一'),
         steps: z.array(z.string()).optional().describe('任务链：共享上下文的子任务列表，一个 worker 串行执行。与 description 二选一'),
-        dependsOn: z.array(z.string()).optional().describe('依赖的 task id 列表。这些 task 完成后本 task 才执行。DAG 模式下上游输出自动注入本任务的 prompt。无此字段=无依赖，立即执行。'),
+        dependsOn: z.array(z.string()).optional().describe('依赖的 task id。这些 task 完成后本 task 才执行。无此字段=立即执行。'),
         context: z.object({
-          text: z.string().optional().describe('文字描述：背景信息、约束条件、注意事项等'),
-          files: z.array(z.string()).optional().describe('文件引用：相关文件路径列表，worker 可用 Read 工具读取'),
-          reqs: z.array(z.string()).optional().describe('需求关联：SPEC REQ 编号列表（如 ["REQ-3.1.2", "REQ-3.1.3"]）'),
-        }).optional().describe('任务上下文。DAG 模式下与上游输出合并注入 prompt。'),
-        cwd: z.string().optional().describe('工作目录（不传则用全局 cwd）'),
-        maxTurns: z.number().optional().describe('最大轮次（fast 默认100，pro 默认200）'),
-      })).describe('任务列表。通过 dependsOn 声明 DAG 依赖关系。DAG 模式下上游输出自动作为下游上下文。上游失败则下游跳过。'),
-      concurrency: z.number().default(5).describe('同层最大并行 worker 数（默认 5）'),
+          text: z.string().optional().describe('背景信息、约束条件'),
+          files: z.array(z.string()).optional().describe('相关文件路径'),
+          reqs: z.array(z.string()).optional().describe('SPEC REQ 编号（如 ["REQ-3.1.2"]）'),
+        }).optional().describe('任务上下文'),
+        cwd: z.string().optional().describe('工作目录'),
+        maxTurns: z.number().optional().describe('最大轮次（fast 默认20，pro 默认50）'),
+      })).describe('任务列表，≥3 个才值得 dispatch'),
+      concurrency: z.number().default(5).describe('同层最大并行数（默认 5）'),
       cwd: z.string().optional().describe('默认工作目录'),
-      mode: z.enum(['fast', 'pro']).default('fast').describe('fast=机械化任务，纯字面量操作 | pro=需理解语义的任务，全工具链，允许独立判断'),
+      mode: z.enum(['fast', 'pro']).default('fast').describe('fast=机械化字面量操作 | pro=需查引用/理解语义（成本高，慎用）'),
     },
     async (args) => {
       try { return await workerDispatch(args); }
