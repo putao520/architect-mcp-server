@@ -1,4 +1,4 @@
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from '@anthropic-ai/claude-agent-sdk';
 import { buildStructuredContext, parseFileStructure } from './parser.mjs';
 import { loadProvider } from './env.mjs';
 import { resolve, join, dirname } from 'path';
@@ -296,11 +296,11 @@ function simpleHash(str) {
   return Math.abs(h).toString(36);
 }
 
-async function runXfWithRetry(task, baseCwd, mode, upstreamResults, isDag, xfSeenHashes) {
+async function runXfWithRetry(task, baseCwd, mode, upstreamResults, isDag, xfSeenHashes, forkFromSession = null) {
   const maxAttempts = XF_MAX_RETRIES + 1;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const result = await runWorkerTask(
-      { ...task, cwd: task.cwd || baseCwd }, baseCwd, loadXfEnv(), mode, WORKER_MODELS.fastXf, upstreamResults, isDag
+      { ...task, cwd: task.cwd || baseCwd }, baseCwd, loadXfEnv(), mode, WORKER_MODELS.fastXf, upstreamResults, isDag, forkFromSession
     );
     if (!result.success) {
       if (attempt < XF_MAX_RETRIES) { await new Promise(r => setTimeout(r, 500)); continue; }
@@ -415,32 +415,34 @@ function buildPrompt(task, upstreamResults, isDag) {
   return parts.join('\n');
 }
 
-async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, upstreamResults = null, isDag = false) {
+async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, upstreamResults = null, isDag = false, forkFromSession = null) {
   let finalResult = null;
   const isPro = mode === 'pro';
   const isGlm = model === WORKER_MODELS.proGlm;
   const isXf = model === WORKER_MODELS.fastXf;
   const prompt = buildPrompt(task, upstreamResults, isDag);
+  let sessionId = null;
 
   if (isGlm) await glmSem.acquire();
   else if (isXf) await xfSem.acquire();
   try {
-    for await (const message of query({
-      prompt,
-      options: {
-        systemPrompt: { type: 'text', text: isPro ? WORKER_SYSTEM_PRO : WORKER_SYSTEM_FAST },
-        cwd: task.cwd || baseCwd || process.cwd(),
-        maxTurns: task.maxTurns || (isPro ? 50 : 20),
-        permissionMode: 'bypassPermissions',
-        allowedTools: isPro ? ALL_TOOLS : WORKER_TOOLS,
-        model: model || WORKER_MODELS.fast,
-        effort: isPro ? 'low' : 'low',
-        env,
-      },
-    })) {
-      if (message.type === 'result') {
-        finalResult = message;
-      }
+    const opts = {
+      systemPrompt: [isPro ? WORKER_SYSTEM_PRO : WORKER_SYSTEM_FAST, SYSTEM_PROMPT_DYNAMIC_BOUNDARY],
+      cwd: task.cwd || baseCwd || process.cwd(),
+      maxTurns: task.maxTurns || (isPro ? 50 : 20),
+      permissionMode: 'bypassPermissions',
+      allowedTools: isPro ? ALL_TOOLS : WORKER_TOOLS,
+      model: model || WORKER_MODELS.fast,
+      effort: 'low',
+      env,
+    };
+    if (forkFromSession) {
+      opts.resume = forkFromSession;
+      opts.forkSession = true;
+    }
+    for await (const message of query({ prompt, options: opts })) {
+      if (message.type === 'result') finalResult = message;
+      if (!sessionId && message.session_id) sessionId = message.session_id;
     }
   } catch (err) {
     if (isGlm) glmSem.release();
@@ -453,7 +455,7 @@ async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, up
   const success = finalResult?.subtype === 'success';
   const raw = finalResult?.result || '(no output)';
   const { summary, output } = isDag ? extractResultJson(raw) : { summary: '', output: null };
-  return { id: task.id, success, result: raw.slice(0, 2000), summary, output };
+  return { id: task.id, success, result: raw.slice(0, 2000), summary, output, sessionId };
 }
 
 async function workerDispatch(args) {
@@ -550,6 +552,7 @@ async function workerDispatch(args) {
     const PRO_GLM_LIMIT = 3;
     const FAST_XF_LIMIT = 5;
     const xfSeenHashes = new Set();
+    const engineSessions = { glm: null, xf: null, deepseek: null }; // 引擎→最近 sessionId，用于 fork
 
     while (ready.length > 0) {
       const batch = ready.splice(0, maxConcurrency);
@@ -568,16 +571,25 @@ async function workerDispatch(args) {
                 context: taskMap.get(depId)?.context || null,
               };
             });
+          // 选择 fork 源：上游同引擎最近成功的 session
+          let forkSession = null;
+          for (const depId of (task.dependsOn || [])) {
+            const dep = resultMap.get(depId);
+            if (dep?.success && dep.sessionId) {
+              forkSession = dep.sessionId;
+              break;
+            }
+          }
           if (isPro) {
             if (idx < PRO_GLM_LIMIT) {
-              return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, loadGlmEnv(), mode, WORKER_MODELS.proGlm, upstreamResults, true);
+              return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, loadGlmEnv(), mode, WORKER_MODELS.proGlm, upstreamResults, true, forkSession);
             }
-            return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes);
+            return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes, forkSession);
           }
           if (idx < FAST_XF_LIMIT) {
-            return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes);
+            return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes, forkSession);
           }
-          return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, env, mode, null, upstreamResults, true);
+          return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, env, mode, null, upstreamResults, true, forkSession);
         })
       );
 
