@@ -259,7 +259,6 @@ const WORKER_SYSTEM_PRO = `你是高级任务执行器。
 const WORKER_MODELS = {
   fast: 'deepseek-v4-flash[1m]',
   fastXf: 'astron-code-latest',
-  pro: 'deepseek-v4-pro[1m]',
   proGlm: 'GLM-5.1',
 };
 
@@ -285,6 +284,42 @@ function createSemaphore(limit) {
 
 const glmSem = createSemaphore(3);
 const xfSem = createSemaphore(5);
+
+// XF 稳定性保障：空响应、非200错误、重复内容
+const XF_MAX_RETRIES = 2;
+
+function simpleHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h).toString(36);
+}
+
+async function runXfWithRetry(task, baseCwd, mode, upstreamResults, isDag, xfSeenHashes) {
+  const maxAttempts = XF_MAX_RETRIES + 1;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const result = await runWorkerTask(
+      { ...task, cwd: task.cwd || baseCwd }, baseCwd, loadXfEnv(), mode, WORKER_MODELS.fastXf, upstreamResults, isDag
+    );
+    if (!result.success) {
+      if (attempt < XF_MAX_RETRIES) { await new Promise(r => setTimeout(r, 500)); continue; }
+      return result;
+    }
+    const raw = result.result || '';
+    if (!raw || raw === '(no output)' || raw.trim().length < 10) {
+      if (attempt < XF_MAX_RETRIES) { await new Promise(r => setTimeout(r, 500)); continue; }
+      return { ...result, success: false, error: `XF empty response after ${maxAttempts} attempts` };
+    }
+    const hash = simpleHash(raw);
+    if (xfSeenHashes.has(hash)) {
+      if (attempt < XF_MAX_RETRIES) { await new Promise(r => setTimeout(r, 500)); continue; }
+      return { ...result, success: false, error: `XF duplicate response after ${maxAttempts} attempts` };
+    }
+    xfSeenHashes.add(hash);
+    return result;
+  }
+}
 
 function loadGlmEnv() {
   return {
@@ -398,7 +433,7 @@ async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, up
         maxTurns: task.maxTurns || (isPro ? 50 : 20),
         permissionMode: 'bypassPermissions',
         allowedTools: isPro ? ALL_TOOLS : WORKER_TOOLS,
-        model: model || WORKER_MODELS[mode],
+        model: model || WORKER_MODELS.fast,
         effort: isPro ? 'low' : 'low',
         env,
       },
@@ -472,28 +507,25 @@ async function workerDispatch(args) {
   const runOrder = []; // 记录执行顺序
 
   if (!hasDeps) {
-    // 无依赖：原始批量并发
-    let extIdx = 0; // GLM/XF 计数器
+    let extIdx = 0;
     const PRO_GLM_LIMIT = 3;
     const FAST_XF_LIMIT = 5;
+    const xfSeenHashes = new Set();
     for (let i = 0; i < tasks.length; i += maxConcurrency) {
       const batch = tasks.slice(i, i + maxConcurrency);
       const batchResults = await Promise.all(
         batch.map((task) => {
-          let useExternal = false;
-          let taskEnv = env;
-          let model = null;
-          if (isPro && extIdx < PRO_GLM_LIMIT) {
-            useExternal = true;
-            taskEnv = loadGlmEnv();
-            model = WORKER_MODELS.proGlm;
-          } else if (!isPro && extIdx < FAST_XF_LIMIT) {
-            useExternal = true;
-            taskEnv = loadXfEnv();
-            model = WORKER_MODELS.fastXf;
+          const idx = extIdx++;
+          if (isPro) {
+            if (idx < PRO_GLM_LIMIT) {
+              return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, loadGlmEnv(), mode, WORKER_MODELS.proGlm);
+            }
+            return runXfWithRetry(task, cwd, mode, null, false, xfSeenHashes);
           }
-          if (useExternal) extIdx++;
-          return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, taskEnv, mode, model);
+          if (idx < FAST_XF_LIMIT) {
+            return runXfWithRetry(task, cwd, mode, null, false, xfSeenHashes);
+          }
+          return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, env, mode, null);
         })
       );
       for (let j = 0; j < batchResults.length; j++) {
@@ -517,23 +549,14 @@ async function workerDispatch(args) {
     let extIdx = 0;
     const PRO_GLM_LIMIT = 3;
     const FAST_XF_LIMIT = 5;
+    const xfSeenHashes = new Set();
 
     while (ready.length > 0) {
       const batch = ready.splice(0, maxConcurrency);
       const batchResults = await Promise.all(
         batch.map((id) => {
           const task = taskMap.get(id);
-          let taskEnv = env;
-          let model = null;
-          if (isPro && extIdx < PRO_GLM_LIMIT) {
-            taskEnv = loadGlmEnv();
-            model = WORKER_MODELS.proGlm;
-          } else if (!isPro && extIdx < FAST_XF_LIMIT) {
-            taskEnv = loadXfEnv();
-            model = WORKER_MODELS.fastXf;
-          }
-          extIdx++;
-          // 收集上游任务的 summary + output + context
+          const idx = extIdx++;
           const upstreamResults = (task.dependsOn || [])
             .filter(depId => resultMap.has(depId) && resultMap.get(depId).success)
             .map(depId => {
@@ -545,7 +568,16 @@ async function workerDispatch(args) {
                 context: taskMap.get(depId)?.context || null,
               };
             });
-          return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, taskEnv, mode, model, upstreamResults, true);
+          if (isPro) {
+            if (idx < PRO_GLM_LIMIT) {
+              return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, loadGlmEnv(), mode, WORKER_MODELS.proGlm, upstreamResults, true);
+            }
+            return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes);
+          }
+          if (idx < FAST_XF_LIMIT) {
+            return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes);
+          }
+          return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, env, mode, null, upstreamResults, true);
         })
       );
 
@@ -581,8 +613,8 @@ async function workerDispatch(args) {
   // === 汇总输出 ===
   const extLimit = isPro ? Math.min(3, tasks.length) : Math.min(5, tasks.length);
   const extLabel = isPro ? `GLM-5.1` : `XF-Astron`;
-  const deepLabel = isPro ? 'DeepSeek v4 Pro' : 'DeepSeek v4 Flash';
-  const engineLabel = `${extLabel}(${extLimit}) + ${deepLabel}(${tasks.length - extLimit})`;
+  const restLabel = isPro ? 'XF-Astron' : 'DeepSeek v4 Flash';
+  const engineLabel = `${extLabel}(${extLimit}) + ${restLabel}(${tasks.length - extLimit})`;
   const dagLabel = hasDeps ? ' | DAG: yes' : ' | DAG: no';
   const out = [`WORKER DISPATCH COMPLETE`, `Tasks: ${tasks.length} | Concurrency: ${maxConcurrency} | Engine: ${engineLabel}${dagLabel} | Mode: ${mode}`, ''];
   const succeeded = runOrder.filter(r => r.success).length;
