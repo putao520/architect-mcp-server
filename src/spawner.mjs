@@ -1,4 +1,4 @@
-import { query, SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from '@anthropic-ai/claude-agent-sdk';
+import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildStructuredContext, parseFileStructure } from './parser.mjs';
 import { loadProvider } from './env.mjs';
 import { resolve, join, dirname } from 'path';
@@ -296,11 +296,11 @@ function simpleHash(str) {
   return Math.abs(h).toString(36);
 }
 
-async function runXfWithRetry(task, baseCwd, mode, upstreamResults, isDag, xfSeenHashes, forkFromSession = null) {
+async function runXfWithRetry(task, baseCwd, mode, upstreamResults, isDag, xfSeenHashes) {
   const maxAttempts = XF_MAX_RETRIES + 1;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const result = await runWorkerTask(
-      { ...task, cwd: task.cwd || baseCwd }, baseCwd, loadXfEnv(), mode, WORKER_MODELS.fastXf, upstreamResults, isDag, forkFromSession
+      { ...task, cwd: task.cwd || baseCwd }, baseCwd, loadXfEnv(), mode, WORKER_MODELS.fastXf, upstreamResults, isDag
     );
     if (!result.success) {
       if (attempt < XF_MAX_RETRIES) { await new Promise(r => setTimeout(r, 500)); continue; }
@@ -415,34 +415,30 @@ function buildPrompt(task, upstreamResults, isDag) {
   return parts.join('\n');
 }
 
-async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, upstreamResults = null, isDag = false, forkFromSession = null) {
+async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, upstreamResults = null, isDag = false) {
   let finalResult = null;
   const isPro = mode === 'pro';
   const isGlm = model === WORKER_MODELS.proGlm;
   const isXf = model === WORKER_MODELS.fastXf;
   const prompt = buildPrompt(task, upstreamResults, isDag);
-  let sessionId = null;
 
   if (isGlm) await glmSem.acquire();
   else if (isXf) await xfSem.acquire();
   try {
-    const opts = {
-      systemPrompt: [isPro ? WORKER_SYSTEM_PRO : WORKER_SYSTEM_FAST, SYSTEM_PROMPT_DYNAMIC_BOUNDARY],
-      cwd: task.cwd || baseCwd || process.cwd(),
-      maxTurns: task.maxTurns,
-      permissionMode: 'bypassPermissions',
-      allowedTools: isPro ? ALL_TOOLS : WORKER_TOOLS,
-      model: model || WORKER_MODELS.fast,
-      effort: 'low',
-      env,
-    };
-    if (forkFromSession) {
-      opts.resume = forkFromSession;
-      opts.forkSession = true;
-    }
-    for await (const message of query({ prompt, options: opts })) {
+    for await (const message of query({
+      prompt,
+      options: {
+        systemPrompt: { type: 'text', text: isPro ? WORKER_SYSTEM_PRO : WORKER_SYSTEM_FAST },
+        cwd: task.cwd || baseCwd || process.cwd(),
+        maxTurns: task.maxTurns,
+        permissionMode: 'bypassPermissions',
+        allowedTools: isPro ? ALL_TOOLS : WORKER_TOOLS,
+        model: model || WORKER_MODELS.fast,
+        effort: 'low',
+        env,
+      },
+    })) {
       if (message.type === 'result') finalResult = message;
-      if (!sessionId && message.session_id) sessionId = message.session_id;
     }
   } catch (err) {
     if (isGlm) glmSem.release();
@@ -455,7 +451,7 @@ async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, up
   const success = finalResult?.subtype === 'success';
   const raw = finalResult?.result || '(no output)';
   const { summary, output } = isDag ? extractResultJson(raw) : { summary: '', output: null };
-  return { id: task.id, success, result: raw.slice(0, 2000), summary, output, sessionId };
+  return { id: task.id, success, result: raw.slice(0, 2000), summary, output };
 }
 
 async function workerDispatch(args) {
@@ -552,7 +548,6 @@ async function workerDispatch(args) {
     const PRO_GLM_LIMIT = 3;
     const FAST_XF_LIMIT = 5;
     const xfSeenHashes = new Set();
-    const engineSessions = { glm: null, xf: null, deepseek: null }; // 引擎→最近 sessionId，用于 fork
 
     while (ready.length > 0) {
       const batch = ready.splice(0, maxConcurrency);
@@ -560,18 +555,8 @@ async function workerDispatch(args) {
         batch.map((id) => {
           const task = taskMap.get(id);
           const idx = extIdx++;
-          // 伪 FORK：仅在单依赖链上启用，merge 节点回退纯 text injection
-          // fan-out（A→B,C）安全：每次 forkSession 创建独立副本
-          // fan-in（B,C→D）禁用 fork：D 只取一个上游会话会丢失其他上游上下文
-          let forkSession = null;
-          if ((task.dependsOn || []).length === 1) {
-            const dep = resultMap.get(task.dependsOn[0]);
-            if (dep?.success && dep.sessionId) forkSession = dep.sessionId;
-          }
-          // fork 时跳过 fork 源的 text injection（已存在于对话历史中），避免重复
-          const skipInject = forkSession ? task.dependsOn[0] : null;
           const upstreamResults = (task.dependsOn || [])
-            .filter(depId => depId !== skipInject && resultMap.has(depId) && resultMap.get(depId).success)
+            .filter(depId => resultMap.has(depId) && resultMap.get(depId).success)
             .map(depId => {
               const dep = resultMap.get(depId);
               return {
@@ -583,14 +568,14 @@ async function workerDispatch(args) {
             });
           if (isPro) {
             if (idx < PRO_GLM_LIMIT) {
-              return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, loadGlmEnv(), mode, WORKER_MODELS.proGlm, upstreamResults, true, forkSession);
+              return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, loadGlmEnv(), mode, WORKER_MODELS.proGlm, upstreamResults, true);
             }
-            return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes, forkSession);
+            return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes);
           }
           if (idx < FAST_XF_LIMIT) {
-            return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes, forkSession);
+            return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes);
           }
-          return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, env, mode, null, upstreamResults, true, forkSession);
+          return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, env, mode, null, upstreamResults, true);
         })
       );
 
