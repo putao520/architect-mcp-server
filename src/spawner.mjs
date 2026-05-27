@@ -226,7 +226,7 @@ const DEFAULT_MAX_TURNS = parseInt(process.env.ARCHITECT_MAX_TURNS || '3000', 10
 
 // === Worker Agent — 机械化低智力任务集群（DeepSeek v4 Flash） ===
 
-function loadWorkerEnv() {
+export function loadWorkerEnv() {
   const provider = loadProvider('deepseek');
   if (!provider) throw new Error('DeepSeek provider not found. Create ~/.gsc/providers/deepseek.json');
   const env = { ...process.env };
@@ -322,7 +322,7 @@ async function runXfWithRetry(task, baseCwd, mode, upstreamResults, isDag, xfSee
   }
 }
 
-function loadGlmEnv() {
+export function loadGlmEnv() {
   return {
     ...process.env,
     ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
@@ -332,7 +332,7 @@ function loadGlmEnv() {
   };
 }
 
-function loadXfEnv() {
+export function loadXfEnv() {
   return {
     ...process.env,
     ANTHROPIC_BASE_URL: 'https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic',
