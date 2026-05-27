@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { registerZ3Tools } from './z3-tools.mjs';
+import { registerSpecTools, execSpec } from './spec-tools.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -822,6 +823,19 @@ export function registerTools(server, env) {
           userPrompt = `审计 SPEC: ${prompt}`;
           if (parsed) userPrompt += `\n\nSPEC 结构:\n${JSON.stringify(parsed, null, 2)}`;
           if (dimensions?.length) userPrompt += `\n\n重点审计维度: ${dimensions.join('、')}`;
+          // 自动前置：spec validate + links + status
+          try {
+            const [validateResult, linksResult, statusResult] = await Promise.all([
+              execSpec(['validate', resolved]).catch(() => null),
+              execSpec(['links', resolved]).catch(() => null),
+              execSpec(['status', resolved]).catch(() => null),
+            ]);
+            const preAudit = [];
+            if (validateResult) preAudit.push(`\n\n--- 自动验证: SPEC VALIDATE ---\n${validateResult.content[0].text}`);
+            if (linksResult) preAudit.push(`\n\n--- 自动验证: SPEC LINKS ---\n${linksResult.content[0].text}`);
+            if (statusResult) preAudit.push(`\n\n--- 自动验证: REQ STATUS ---\n${statusResult.content[0].text}`);
+            if (preAudit.length) userPrompt += preAudit.join('');
+          } catch {}
           break;
         }
         case 'review': {
@@ -903,4 +917,7 @@ export function registerTools(server, env) {
 
   // === Z3 SPEC Verification Tools ===
   registerZ3Tools(server);
+
+  // === Spec-Tools CLI（validate/links/status/graph/migrate） ===
+  registerSpecTools(server);
 }

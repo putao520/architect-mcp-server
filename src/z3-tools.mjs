@@ -929,43 +929,46 @@ async function verifyAlignment(params) {
   return { content: [{ type: 'text', text: out.join('\n') }] };
 }
 
-// === 工具注册（4 个） ===
+// === 工具注册（1 个统一工具，4 种模式） ===
 
 export function registerZ3Tools(server) {
-  server.tool('verify_spec',
-    'SPEC约束一致性验证：数据约束求解+全局一致性+两两冲突检测。',
-    { specPath: z.string().describe('SPEC 目录路径或单个 SPEC 文件路径') },
-    verifySpec);
-
-  server.tool('verify_formal',
-    '形式化验证。契约模式：preconditions→postconditions。反例模式：constraints+property→Z3求解违反值。',
+  server.tool('verify',
+    '形式化验证工具。spec=SPEC约束一致性(former verify_spec) | formal=契约/反例验证 | state_machine=状态机完备性 | alignment=SPEC-代码类型对齐。',
     {
-      constraints: z.string().optional().describe('[反例模式] 约束条件，每行一个。支持：x >= 5, x == "hello", IF p THEN q, x ∈ [0,100]'),
-      property: z.string().optional().describe('[反例模式] 要验证的属性（取反后搜索反例）'),
-      preconditions: z.array(z.string()).optional().describe('[契约模式] 前置条件数组，如：age >= 18'),
-      postconditions: z.array(z.string()).optional().describe('[契约模式] 后置条件数组。提供此项则自动切换到契约模式'),
+      mode: z.enum(['spec', 'formal', 'state_machine', 'alignment']).describe('spec=SPEC约束一致性 | formal=契约/反例验证 | state_machine=状态机完备性 | alignment=类型对齐'),
+      // spec 模式
+      specPath: z.string().optional().describe('[spec] SPEC 目录路径或文件路径'),
+      // formal 模式
+      constraints: z.string().optional().describe('[formal/反例] 约束条件，每行一个。支持：x >= 5, x == "hello", IF p THEN q, x ∈ [0,100]'),
+      property: z.string().optional().describe('[formal/反例] 要验证的属性（取反后搜索反例）'),
+      preconditions: z.array(z.string()).optional().describe('[formal/契约] 前置条件数组'),
+      postconditions: z.array(z.string()).optional().describe('[formal/契约] 后置条件数组。提供此项自动切换到契约模式'),
+      // state_machine 模式
+      states: z.array(z.string()).optional().describe('[state_machine] 状态名称数组'),
+      transitions: z.array(z.object({ from: z.string(), to: z.string(), on: z.string().optional() })).optional().describe('[state_machine] 转换数组：{from, to, on?}'),
+      initialState: z.string().optional().describe('[state_machine] 初始状态名（默认 states[0]）'),
+      // alignment 模式
+      specConstraints: z.array(z.string()).optional().describe('[alignment/批量] SPEC 约束数组'),
+      codeTypes: z.array(z.object({ field: z.string(), type: z.string() })).optional().describe('[alignment/批量] 代码类型定义'),
+      strictMode: z.boolean().default(false).describe('[alignment/批量] 严格模式'),
+      fieldType: z.string().optional().describe('[alignment/单字段] 字段名'),
+      codeType: z.string().optional().describe('[alignment/单字段] 代码类型'),
+      specConstraint: z.string().optional().describe('[alignment/单字段] SPEC 约束'),
     },
-    verifyFormal);
-
-  server.tool('verify_state_machine',
-    '状态机完备性证明：可达性+终止性+确定性。BFS+Z3双重验证。',
-    {
-      states: z.array(z.string()).describe('状态名称数组'),
-      transitions: z.array(z.object({ from: z.string(), to: z.string(), on: z.string().optional() })).describe('转换数组：{from, to, on?}'),
-      initialState: z.string().optional().describe('初始状态名（默认 states[0]）'),
-    },
-    verifyStateMachine);
-
-  server.tool('verify_alignment',
-    'SPEC-代码类型对齐验证(Z3)。单字段模式：fieldType+codeType+specConstraint。批量模式：specConstraints+codeTypes。',
-    {
-      specPath: z.string().optional().describe('[未使用，保留扩展] SPEC 路径'),
-      specConstraints: z.array(z.string()).optional().describe('[批量模式] SPEC 约束数组'),
-      codeTypes: z.array(z.object({ field: z.string(), type: z.string() })).optional().describe('[批量模式] 代码类型定义'),
-      strictMode: z.boolean().default(false).describe('[批量模式] 严格模式：额外检查代码中有但 SPEC 无的字段'),
-      fieldType: z.string().optional().describe('[单字段模式] 字段名'),
-      codeType: z.string().optional().describe('[单字段模式] 代码类型（如 number, u8, "A" | "B"）'),
-      specConstraint: z.string().optional().describe('[单字段模式] SPEC 约束（如 age >= 18）'),
-    },
-    verifyAlignment);
+    async (args) => {
+      switch (args.mode) {
+        case 'spec':
+          if (!args.specPath) return { content: [{ type: 'text', text: 'ERROR: specPath required for spec mode' }] };
+          return verifySpec(args);
+        case 'formal':
+          return verifyFormal(args);
+        case 'state_machine':
+          if (!args.states) return { content: [{ type: 'text', text: 'ERROR: states required for state_machine mode' }] };
+          return verifyStateMachine(args);
+        case 'alignment':
+          return verifyAlignment(args);
+        default:
+          return { content: [{ type: 'text', text: `ERROR: unknown mode "${args.mode}"` }] };
+      }
+    });
 }
