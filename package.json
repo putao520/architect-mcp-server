@@ -1,20 +1,39 @@
 {
   "name": "architect-mcp-server",
-  "version": "0.4.0",
-  "description": "Architect MCP Server — 架构顾问工具，通过 JS SDK 生成子 CC 执行深度分析、SPEC 审计、代码审查",
+  "version": "0.6.0",
+  "description": "Architect MCP Server — 统一工具链：架构分析 + SPEC管理 + LSP + DAP + 逆向工程",
   "type": "module",
   "main": "src/index.mjs",
   "bin": {
-    "architect-mcp-server": "src/index.mjs"
+    "architect-mcp-server": "src/index.mjs",
+    "spec": "bin/spec.mjs"
   },
   "scripts": {
-    "start": "node src/index.mjs"
+    "start": "node src/index.mjs",
+    "spec": "node bin/spec.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",
+    "@apidevtools/swagger-parser": "^12.1.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "@tree-sitter-grammars/tree-sitter-markdown": "^0.3.2",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "glob": "^11.0.0",
+    "js-yaml": "^4.1.1",
     "koffi": "^3.0.1",
-    "web-tree-sitter": "^0.25.0",
+    "linkedom": "^0.18.0",
+    "markdown-it": "^14.2.0",
+    "tree-sitter-c": "^0.24.1",
+    "tree-sitter-cpp": "^0.23.4",
+    "tree-sitter-go": "^0.25.0",
+    "tree-sitter-html": "^0.23.2",
+    "tree-sitter-java": "^0.23.5",
+    "tree-sitter-javascript": "^0.25.0",
+    "tree-sitter-python": "^0.25.0",
+    "tree-sitter-rust": "^0.24.0",
+    "tree-sitter-typescript": "^0.23.2",
+    "web-tree-sitter": "^0.26.9",
     "ws": "^8.20.1",
     "z3-solver": "^4.16.0",
     "zod": "^3.25.0"
