@@ -4,7 +4,7 @@
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, realpathSync } from 'fs';
 import { extname, dirname, basename, join, resolve as pathResolve } from 'path';
-import { homedir, tmpdir } from 'os';
+import { homedir, tmpdir, userInfo } from 'os';
 import { connect as netConnect } from 'net';
 import { fileURLToPath } from 'url';
 
@@ -132,12 +132,22 @@ export function hashCwd(cwd) {
   return Math.abs(h).toString(36);
 }
 
+export function getUid() {
+  try { return process.getuid(); } catch {
+    let h = 0;
+    for (let i = 0; i < userInfo().username.length; i++) {
+      h = ((h << 5) - h + userInfo().username.charCodeAt(i)) | 0;
+    }
+    return Math.abs(h);
+  }
+}
+
 export function socketPath(language, cwd) {
-  return join(tmpdir(), `lsp-${language}-${hashCwd(cwd)}-${process.getuid()}.sock`);
+  return join(tmpdir(), `lsp-${language}-${hashCwd(cwd)}-${getUid()}.sock`);
 }
 
 export function pidPath(language, cwd) {
-  return join(tmpdir(), `lsp-${language}-${hashCwd(cwd)}-${process.getuid()}.pid`);
+  return join(tmpdir(), `lsp-${language}-${hashCwd(cwd)}-${getUid()}.pid`);
 }
 
 export function getDaemonPath() {

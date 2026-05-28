@@ -1,12 +1,10 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildStructuredContext, parseFileStructure } from './parser.mjs';
-import { loadProvider, buildSdkEnv } from './env.mjs';
-import { homedir, tmpdir } from 'os';
-import { resolve, join, dirname } from 'path';
-import { readFileSync, writeFileSync, unlinkSync, openSync, closeSync, existsSync, readdirSync, statSync } from 'fs';
+import { buildSdkEnv } from './env.mjs';
+import { resolve, join, dirname, extname, basename } from 'path';
+import { existsSync, readdirSync, statSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
-import { randomUUID } from 'crypto';
 import { registerZ3Tools } from './z3-tools.mjs';
 import { registerSpecTools } from './spec-tools.mjs';
 import { registerCrudTools } from './spec/crud/index.mjs';
@@ -21,214 +19,6 @@ import { trackStatus } from './spec/status/tracker.mjs';
 import { reportJson } from './spec/status/reporter.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// === RWKV WebSocket 客户端 ===
-// 架构：rwkv-server.mjs 是独立 WS 服务，MCP server 通过 WS 客户端调用
-// WS 连接持久化，session 跨请求复用，流式 token 接收
-
-const RWKV_SERVER_PORT = parseInt(process.env.RWKV_SERVER_PORT || '19876', 10);
-const RWKV_WS_URL = `ws://127.0.0.1:${RWKV_SERVER_PORT}/ws`;
-const RWKV_PID_FILE = join(homedir() || '/tmp', '.rwkv-server.json');
-const RWKV_LOCK_FILE = join(tmpdir(), 'rwkv-server-start.lock');
-
-async function isServerAlive(port) {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) });
-    return res.ok;
-  } catch { return false; }
-}
-
-function acquireLock() {
-  try {
-    const fd = openSync(RWKV_LOCK_FILE, 'wx');
-    writeFileSync(fd, String(process.pid));
-    closeSync(fd);
-    return true;
-  } catch { return false; }
-}
-
-function releaseLock() {
-  try { unlinkSync(RWKV_LOCK_FILE); } catch {}
-}
-
-async function ensureRwkvServer() {
-  try {
-    const pidInfo = JSON.parse(readFileSync(RWKV_PID_FILE, 'utf-8'));
-    if (pidInfo?.port && await isServerAlive(pidInfo.port)) return;
-  } catch {}
-
-  if (!acquireLock()) {
-    for (let i = 0; i < 60; i++) {
-      await new Promise(r => setTimeout(r, 1000));
-      if (await isServerAlive(RWKV_SERVER_PORT)) return;
-      if (!existsSync(RWKV_LOCK_FILE) && acquireLock()) break;
-    }
-    if (await isServerAlive(RWKV_SERVER_PORT)) return;
-    releaseLock();
-    throw new Error('RWKV server failed to start within 60s (waited for another instance)');
-  }
-
-  try {
-    const child = spawn('node', [join(__dirname, 'rwkv-server.mjs')], {
-      detached: true,
-      stdio: 'ignore',
-      env: { ...process.env },
-    });
-    child.unref();
-
-    for (let i = 0; i < 60; i++) {
-      await new Promise(r => setTimeout(r, 1000));
-      if (await isServerAlive(RWKV_SERVER_PORT)) return;
-    }
-    throw new Error('RWKV server failed to start within 60s');
-  } finally {
-    releaseLock();
-  }
-}
-
-class RwkvWSClient {
-  #ws = null;
-  #pending = new Map(); // requestId → { resolve, reject }
-  #onToken = null;
-  #connectPromise = null;
-
-  set onToken(cb) { this.#onToken = cb; }
-
-  async connect() {
-    if (this.#ws?.readyState === 1) return;
-    if (this.#connectPromise) return this.#connectPromise;
-
-    this.#connectPromise = this.#doConnect();
-    try { await this.#connectPromise; }
-    finally { this.#connectPromise = null; }
-  }
-
-  async #doConnect() {
-    await ensureRwkvServer();
-    this.#ws = new WebSocket(RWKV_WS_URL);
-
-    await new Promise((resolve, reject) => {
-      this.#ws.addEventListener('open', resolve, { once: true });
-      this.#ws.addEventListener('error', (ev) => reject(new Error(ev.message || 'WS connect error')), { once: true });
-      setTimeout(() => reject(new Error('WS connect timeout')), 10000);
-    });
-
-    this.#ws.addEventListener('message', (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.requestId && this.#pending.has(msg.requestId)) {
-        const { resolve } = this.#pending.get(msg.requestId);
-        this.#pending.delete(msg.requestId);
-        resolve(msg);
-      }
-      if (msg.type === 'token' && this.#onToken) this.#onToken(msg);
-    });
-
-    this.#ws.addEventListener('close', () => { this.#ws = null; });
-    this.#ws.addEventListener('error', () => { this.#ws = null; });
-  }
-
-  async send(msg) {
-    await this.connect();
-    const requestId = randomUUID();
-    return new Promise((resolve, reject) => {
-      this.#pending.set(requestId, { resolve, reject });
-      this.#ws.send(JSON.stringify({ ...msg, requestId }));
-      setTimeout(() => {
-        if (this.#pending.has(requestId)) {
-          this.#pending.delete(requestId);
-          reject(new Error(`WS request timeout: ${msg.type}`));
-        }
-      }, 7200000);
-    });
-  }
-
-  async createSession() {
-    const resp = await this.send({ type: 'session.create' });
-    if (resp.type === 'error') throw new Error(resp.message);
-    return resp.sessionId;
-  }
-
-  async feedPrompt(sessionId, text) {
-    const resp = await this.send({ type: 'session.feedPrompt', sessionId, text });
-    if (resp.type === 'error') throw new Error(resp.message);
-  }
-
-  async feedChatPrompt(sessionId, text, options = {}) {
-    const resp = await this.send({ type: 'session.feedChatPrompt', sessionId, text, options });
-    if (resp.type === 'error') throw new Error(resp.message);
-  }
-
-  async generate(sessionId, maxTokens, options = {}) {
-    const resp = await this.send({ type: 'session.generate', sessionId, maxTokens, options });
-    if (resp.type === 'error') throw new Error(resp.message);
-    return { text: resp.text, tokenCount: resp.tokenCount };
-  }
-
-  async thinkGenerate(sessionId, maxAnswerTokens, options = {}) {
-    const resp = await this.send({ type: 'session.thinkGenerate', sessionId, maxAnswerTokens, options });
-    if (resp.type === 'error') throw new Error(resp.message);
-    return { thinking: resp.thinking, answer: resp.answer };
-  }
-
-  async multiRoundThink(sessionId, prompt, options = {}) {
-    const resp = await this.send({ type: 'session.multiRoundThink', sessionId, prompt, options });
-    if (resp.type === 'error') throw new Error(resp.message);
-    return { rounds: resp.rounds, totalRounds: resp.totalRounds, converged: resp.converged, finalAnswer: resp.finalAnswer };
-  }
-
-  async exportState(sessionId) {
-    const resp = await this.send({ type: 'session.exportState', sessionId });
-    if (resp.type === 'error') throw new Error(resp.message);
-    return resp.stateB64;
-  }
-
-  async importState(sessionId, stateB64) {
-    const resp = await this.send({ type: 'session.importState', sessionId, stateB64 });
-    if (resp.type === 'error') throw new Error(resp.message);
-  }
-
-  async pin(sessionId) {
-    const resp = await this.send({ type: 'session.pin', sessionId });
-    if (resp.type === 'error') throw new Error(resp.message);
-  }
-
-  async unpin(sessionId) {
-    const resp = await this.send({ type: 'session.unpin', sessionId });
-    if (resp.type === 'error') throw new Error(resp.message);
-  }
-
-  async destroySession(sessionId) {
-    const resp = await this.send({ type: 'session.destroy', sessionId });
-    if (resp.type === 'error') throw new Error(resp.message);
-  }
-
-  async callTool(tool, args) {
-    const resp = await this.send({ type: 'tool.execute', tool, args });
-    if (resp.type === 'error') throw new Error(resp.message);
-    return resp;
-  }
-
-  disconnect() {
-    if (this.#ws) { this.#ws.close(); this.#ws = null; }
-  }
-}
-
-let rwkvClient = null;
-
-async function getRwkvClient() {
-  if (!rwkvClient) {
-    rwkvClient = new RwkvWSClient();
-    await rwkvClient.connect();
-  }
-  return rwkvClient;
-}
-
-// callRwkvTool — RWKV 工具已禁用，待恢复时取消注释
-// async function callRwkvTool(tool, args) {
-//   const client = await getRwkvClient();
-//   const result = await client.callTool(tool, args);
-//   return result;
-// }
 
 // === Architect Consultation 子 CC（Claude SDK） ===
 
@@ -881,11 +671,6 @@ export function registerTools(server, env) {
       }
     },
   );
-
-  // === RWKV 工具已禁用（2.9B 模型能力不足，待更换更强模型后恢复） ===
-  // abstract_reasoning 和 deep_read 注册已注释
-  //
-  // 原始注册代码见 git history
 
   // === Tool 4: worker_dispatch — 高并发批量任务执行器 ===
 
