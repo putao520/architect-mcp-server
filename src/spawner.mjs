@@ -1,6 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildStructuredContext, parseFileStructure } from './parser.mjs';
-import { loadProvider, loadEnv } from './env.mjs';
+import { loadProvider, buildSdkEnv } from './env.mjs';
 import { resolve, join, dirname } from 'path';
 import { readFileSync, writeFileSync, unlinkSync, openSync, closeSync, existsSync, readdirSync, statSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -235,19 +235,6 @@ const DEFAULT_MAX_TURNS = parseInt(process.env.ARCHITECT_MAX_TURNS || '3000', 10
 
 // === Worker Agent — 机械化低智力任务集群（DeepSeek v4 Flash） ===
 
-export function loadWorkerEnv() {
-  const provider = loadProvider('deepseek');
-  if (!provider) throw new Error('DeepSeek provider not found. Create ~/.gsc/providers/deepseek.json');
-  const env = { ...process.env };
-  env.ANTHROPIC_BASE_URL = provider.endpoint;
-  const enabled = (provider.accounts || []).filter(a => a.enabled !== false);
-  if (enabled.length > 0) env.ANTHROPIC_AUTH_TOKEN = enabled[0].token;
-  if (provider.env) {
-    for (const e of provider.env) env[e.name] = e.value;
-  }
-  return env;
-}
-
 const WORKER_TOOLS = [
   'Read', 'Glob', 'Grep', 'Bash', 'Edit',
   'mcp__arch__lsp_symbol_profile',
@@ -313,7 +300,7 @@ async function runXfWithRetry(task, baseCwd, mode, upstreamResults, isDag, xfSee
   const maxAttempts = XF_MAX_RETRIES + 1;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const result = await runWorkerTask(
-      { ...task, cwd: task.cwd || baseCwd }, baseCwd, loadXfEnv(), mode, WORKER_MODELS.fastXf, upstreamResults, isDag
+      { ...task, cwd: task.cwd || baseCwd }, baseCwd, buildSdkEnv('xf-astron'), mode, WORKER_MODELS.fastXf, upstreamResults, isDag
     );
     if (!result.success) {
       if (attempt < XF_MAX_RETRIES) { await new Promise(r => setTimeout(r, 500)); continue; }
@@ -334,30 +321,7 @@ async function runXfWithRetry(task, baseCwd, mode, upstreamResults, isDag, xfSee
   }
 }
 
-function loadProviderEnv(base, token) {
-  return {
-    ...process.env,
-    ANTHROPIC_BASE_URL: base,
-    ANTHROPIC_AUTH_TOKEN: token,
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-    CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
-  };
-}
-
-function loadProviderEnvFromFile(providerName) {
-  return loadEnv(providerName);
-}
-
-export function loadGlmEnv() {
-  if (process.env.GLM_AUTH_TOKEN) return loadProviderEnv('https://open.bigmodel.cn/api/anthropic', process.env.GLM_AUTH_TOKEN);
-  return loadProviderEnvFromFile('glm');
-}
-
-export function loadXfEnv() {
-  if (process.env.XF_AUTH_TOKEN) return loadProviderEnv('https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic', process.env.XF_AUTH_TOKEN);
-  if (process.env.ANTHROPIC_AUTH_TOKEN && process.env.ANTHROPIC_BASE_URL?.includes('xf-yun')) return { ...process.env };
-  return loadProviderEnvFromFile('xf-astron');
-}
+// === Helper functions ===
 
 const RESULT_JSON_INSTRUCTION = `
 
@@ -474,7 +438,7 @@ async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, up
 
 async function workerDispatch(args) {
   const { tasks, concurrency = 5, cwd, mode = 'fast' } = args;
-  const env = loadWorkerEnv();
+  const env = buildSdkEnv('deepseek');
   const isPro = mode === 'pro';
   const maxConcurrency = Math.max(concurrency, 1);
 
@@ -534,7 +498,7 @@ async function workerDispatch(args) {
           const idx = extIdx++;
           if (isPro) {
             if (idx < PRO_GLM_LIMIT) {
-              return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, loadGlmEnv(), mode, WORKER_MODELS.proGlm);
+              return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, buildSdkEnv('glm'), mode, WORKER_MODELS.proGlm);
             }
             return runXfWithRetry(task, cwd, mode, null, false, xfSeenHashes);
           }
@@ -586,7 +550,7 @@ async function workerDispatch(args) {
             });
           if (isPro) {
             if (idx < PRO_GLM_LIMIT) {
-              return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, loadGlmEnv(), mode, WORKER_MODELS.proGlm, upstreamResults, true);
+              return runWorkerTask({ ...task, cwd: task.cwd || cwd }, cwd, buildSdkEnv('glm'), mode, WORKER_MODELS.proGlm, upstreamResults, true);
             }
             return runXfWithRetry(task, cwd, mode, upstreamResults, true, xfSeenHashes);
           }

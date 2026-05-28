@@ -1,62 +1,125 @@
-// spec-tools MCP 工具 — spec_validate + spec_status + spec_migrate
-// spec_migrate: CC SDK Agent（复用 spec-tools/src/migrate/agent.mjs）
-// spec_validate/spec_status: CLI 包装
+// spec-tools MCP 工具 — 统一入口
+// 所有功能直接调用 spec/ 模块，不 spawn CLI
 
 import { z } from 'zod';
-import { spawn } from 'child_process';
-import { loadGlmEnv } from './spawner.mjs';
-import { MIGRATE_SYSTEM_PROMPT, migrateSingleFile, migrateBatch } from '/home/putao/code/claude/spec-tools/src/migrate/agent.mjs';
-
-const SPEC_BIN = 'spec';
-const EXEC_TIMEOUT = 600_000;
-
-export function execSpec(args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(SPEC_BIN, args, { timeout: EXEC_TIMEOUT });
-    let stdout = '';
-    let stderr = '';
-    proc.stdout.on('data', (d) => { stdout += d; });
-    proc.stderr.on('data', (d) => { stderr += d; });
-    proc.on('close', (code) => {
-      const output = stdout || stderr || '(no output)';
-      if (code === 0) {
-        resolve({ content: [{ type: 'text', text: output }] });
-      } else {
-        resolve({ content: [{ type: 'text', text: `EXIT CODE: ${code}\n${output}` }], isError: true });
-      }
-    });
-    proc.on('error', (err) => reject(err));
-  });
-}
+import { buildSdkEnv } from './env.mjs';
+import { parseSpecDir } from './spec/parse/html-parser.mjs';
+import { validateAll } from './spec/validate/index.mjs';
+import { validateLinks } from './spec/validate/links.mjs';
+import { trackStatus } from './spec/status/tracker.mjs';
+import { reportJson } from './spec/status/reporter.mjs';
+import { verifyMigration } from './spec/migrate/verify.mjs';
+import { migrateSingleFile, migrateBatch } from './spec/migrate/agent.mjs';
+import { registerSpecAuditTools } from './spec/audit/index.mjs';
+import { auditMaturity } from './spec/audit/maturity.mjs';
+import { fixLinks } from './spec/transform/fix-links.mjs';
+import { writeIndexHtml } from './spec/transform/index-builder.mjs';
+import { formatValidationResult } from './spec/utils/format.mjs';
 
 export function registerSpecTools(server) {
+  registerSpecAuditTools(server);
+  registerOpenApiTools(server);
+  registerSchemaTools(server);
+
+  // === MERGE-1: spec_lint (validate + health + fix) ===
+
   server.tool(
-    'spec_validate',
-    'SPEC完整性验证 + 交叉引用检查：data-* 属性、JSON-LD 结构、data-xref 双向链接、断链检测。',
+    'spec_lint',
+    'SPEC 质量门控：validate/health/fix 统一入口。check=验证+链接检查 | health=验证+成熟度+状态 | fix=自动修复+重新验证',
     {
       dir: z.string().describe('SPEC 目录路径'),
-      checkLinks: z.boolean().default(true).describe('是否同时检查交叉引用（默认 true）'),
+      action: z.enum(['check', 'health', 'fix']).default('check').describe('check=验证 | health=健康报告 | fix=自动修复'),
+      checkLinks: z.boolean().default(true).describe('[check] 是否同时检查交叉引用'),
+      sourceDir: z.string().optional().describe('[health] 源码目录（Code 层覆盖率）'),
+      fixLinksFlag: z.boolean().default(true).describe('[fix] 修复断链'),
+      regenerateIndex: z.boolean().default(false).describe('[fix] 重新生成 00-INDEX.html'),
     },
     async (args) => {
-      const results = [];
-      const validateResult = await execSpec(['validate', args.dir]);
-      results.push('=== SPEC VALIDATE ===');
-      results.push(validateResult.content[0].text);
-      if (args.checkLinks) {
-        const linksResult = await execSpec(['links', args.dir]);
-        results.push('\n=== SPEC LINKS ===');
-        results.push(linksResult.content[0].text);
+      const { dir, action } = args;
+
+      if (action === 'check') {
+        const index = parseSpecDir(dir);
+        const lines = [];
+        const validateResult = validateAll(index);
+        lines.push('=== SPEC VALIDATE ===');
+        lines.push(formatValidationResult('Validate', validateResult));
+        if (args.checkLinks) {
+          const linksResult = validateLinks(index);
+          lines.push('\n=== SPEC LINKS ===');
+          lines.push(formatValidationResult('Links', linksResult));
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
       }
-      return { content: [{ type: 'text', text: results.join('\n') }] };
+
+      if (action === 'health') {
+        const index = parseSpecDir(dir);
+        const lines = [];
+
+        const validateResult = validateAll(index);
+        lines.push('=== VALIDATE ===');
+        lines.push(formatValidationResult('Validate', validateResult));
+
+        lines.push('\n=== MATURITY ===');
+        const maturityResult = auditMaturity(index, { sourceDir: args.sourceDir });
+        lines.push(`Maturity: ${(maturityResult.totals.maturity * 100).toFixed(1)}%`);
+        lines.push(`  Design: ${(maturityResult.totals.designRate * 100).toFixed(1)}% | Code: ${maturityResult.totals.codeRate != null ? (maturityResult.totals.codeRate * 100).toFixed(1) + '%' : 'N/A'} | Test: ${(maturityResult.totals.testRate * 100).toFixed(1)}%`);
+        lines.push(`  REQs: ${maturityResult.totals.specCount} | Domains: ${maturityResult.domains.length}`);
+
+        lines.push('\n=== STATUS ===');
+        const statusResult = trackStatus(index);
+        lines.push(reportJson(statusResult));
+
+        const hasErrors = validateResult.errors.length > 0;
+        lines.push(`\n=== SUMMARY === ${hasErrors ? 'BLOCKED' : 'HEALTHY'} — ${validateResult.errors.length} errors, ${validateResult.warnings.length} warnings`);
+        return { content: [{ type: 'text', text: lines.join('\n') }], isError: hasErrors };
+      }
+
+      if (action === 'fix') {
+        const lines = [];
+
+        if (args.fixLinksFlag) {
+          const result = fixLinks(dir);
+          lines.push(`Fix Links: ${result.totalFixed} links fixed (${result.anchors} anchors, ${result.reqs} REQs indexed)`);
+        }
+
+        if (args.regenerateIndex) {
+          writeIndexHtml(dir);
+          lines.push('Index: 00-INDEX.html regenerated');
+        }
+
+        const index = parseSpecDir(dir);
+        const validateResult = validateAll(index);
+        lines.push('\n=== POST-FIX VALIDATE ===');
+        lines.push(formatValidationResult('Validate', validateResult));
+
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
     },
   );
+
+  // === MERGE-2: spec_status (list + reindex) ===
 
   server.tool(
     'spec_status',
-    'REQ 状态列表：查询所有 data-req 需求及其状态。',
-    { dir: z.string().describe('SPEC 目录路径') },
-    (args) => execSpec(['status', args.dir]),
+    'REQ 状态管理：list=查询所有 REQ 状态 | reindex=重新生成 00-INDEX.html',
+    {
+      dir: z.string().describe('SPEC 目录路径'),
+      action: z.enum(['list', 'reindex']).default('list').describe('list=状态列表 | reindex=生成索引'),
+    },
+    (args) => {
+      if (args.action === 'reindex') {
+        writeIndexHtml(args.dir);
+        return { content: [{ type: 'text', text: `00-INDEX.html generated in ${args.dir}` }] };
+      }
+
+      const index = parseSpecDir(args.dir);
+      const result = trackStatus(index);
+      const text = reportJson(result);
+      return { content: [{ type: 'text', text }] };
+    },
   );
+
+  // === spec_migrate (unchanged, already has subcommand dispatch) ===
 
   server.tool(
     'spec_migrate',
@@ -72,25 +135,37 @@ export function registerSpecTools(server) {
     },
     async (args) => {
       try {
-        const glmEnv = loadGlmEnv();
+        const glmEnv = buildSdkEnv('glm');
         const env = { MODEL: 'GLM-5.1', env: glmEnv };
 
         switch (args.subcommand) {
           case 'single': {
             if (!args.mdFile) throw new Error('mdFile required for single');
             const result = await migrateSingleFile(args.mdFile, args.specDir || dirname(args.mdFile), args.outputDir, env);
-            return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+            const summary = { file: result.file, success: result.success };
+            if (result.error) summary.error = result.error;
+            summary.output = result.output;
+            return { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] };
           }
           case 'run': {
             if (!args.mdDir) throw new Error('mdDir required for run');
             const results = await migrateBatch(args.mdDir, args.outputDir || args.mdDir, env);
             const ok = results.filter(r => r.success && !r.skipped).length;
+            const skip = results.filter(r => r.skipped).length;
             const fail = results.filter(r => !r.success).length;
-            return { content: [{ type: 'text', text: `Done: ${ok} OK, ${fail} FAIL\n${JSON.stringify(results, null, 2)}` }] };
+            const summaries = results.map(r => {
+              const s = { file: r.file, success: r.success };
+              if (r.skipped) s.skipped = true;
+              if (r.error) s.error = r.error;
+              if (r.output) s.output = r.output;
+              return s;
+            });
+            return { content: [{ type: 'text', text: `Done: ${ok} OK, ${skip} skipped, ${fail} FAIL\n${JSON.stringify(summaries, null, 2)}` }] };
           }
           case 'verify': {
             if (!args.mdDir || !args.htmlDir) throw new Error('mdDir and htmlDir required for verify');
-            return await execSpec(['migrate', 'verify', args.mdDir, args.htmlDir]);
+            const result = verifyMigration(args.mdDir, args.htmlDir);
+            return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
           }
         }
       } catch (err) {
