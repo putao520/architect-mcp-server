@@ -1,6 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildStructuredContext, parseFileStructure } from './parser.mjs';
 import { loadProvider, buildSdkEnv } from './env.mjs';
+import { homedir, tmpdir } from 'os';
 import { resolve, join, dirname } from 'path';
 import { readFileSync, writeFileSync, unlinkSync, openSync, closeSync, existsSync, readdirSync, statSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -27,8 +28,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const RWKV_SERVER_PORT = parseInt(process.env.RWKV_SERVER_PORT || '19876', 10);
 const RWKV_WS_URL = `ws://127.0.0.1:${RWKV_SERVER_PORT}/ws`;
-const RWKV_PID_FILE = join(process.env.HOME || '/tmp', '.rwkv-server.json');
-const RWKV_LOCK_FILE = '/tmp/rwkv-server-start.lock';
+const RWKV_PID_FILE = join(homedir() || '/tmp', '.rwkv-server.json');
+const RWKV_LOCK_FILE = join(tmpdir(), 'rwkv-server-start.lock');
 
 async function isServerAlive(port) {
   try {

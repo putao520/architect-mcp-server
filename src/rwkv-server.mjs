@@ -12,7 +12,10 @@ import { join, dirname, resolve, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync, readFileSync, writeFileSync, statSync, readdirSync, mkdirSync } from 'fs';
 import { createHash, randomUUID } from 'crypto';
+import { homedir } from 'os';
 import { RwkvSession } from './rwkv-binding.mjs';
+
+const HOME = homedir();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -424,7 +427,7 @@ async function deepRead(args, ws, requestId) {
 
 // === Project Memory ===
 
-const STATES_DIR = join(process.env.HOME || '/tmp', '.rwkv-states');
+const STATES_DIR = join(homedir(), '.rwkv-states');
 const DEFAULT_EXCLUDE = ['.git', 'node_modules', '__pycache__', '.DS_Store', 'target', 'dist', 'build', '.cache', '.claude', 'venv', '.venv'];
 
 function ensureDir(dir) { if (!existsSync(dir)) mkdirSync(dir, { recursive: true }); }
@@ -929,7 +932,7 @@ function handleConnection(ws) {
 // === 服务器启动 ===
 
 const PORT = parseInt(process.env.RWKV_SERVER_PORT || '19876', 10);
-const PID_FILE = join(process.env.HOME || '/tmp', '.rwkv-server.json');
+const PID_FILE = join(homedir(), '.rwkv-server.json');
 
 async function main() {
   console.error('[rwkv-server] Loading RWKV model...');

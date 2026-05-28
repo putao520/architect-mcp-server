@@ -1,8 +1,9 @@
 import { existsSync, readFileSync } from 'fs';
 import { resolve } from 'path';
+import { homedir } from 'os';
 
 export function loadProvider(providerName = 'deepseek') {
-  const configPath = resolve(process.env.HOME, '.gsc', 'providers', `${providerName}.json`);
+  const configPath = resolve(homedir(), '.gsc', 'providers', `${providerName}.json`);
   if (!existsSync(configPath)) return null;
   try {
     return JSON.parse(readFileSync(configPath, 'utf8'));
