@@ -1,14 +1,23 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildStructuredContext, parseFileStructure } from './parser.mjs';
-import { loadProvider } from './env.mjs';
+import { loadProvider, loadEnv } from './env.mjs';
 import { resolve, join, dirname } from 'path';
-import { readFileSync, writeFileSync, unlinkSync, openSync, closeSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, openSync, closeSync, existsSync, readdirSync, statSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
-import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { registerZ3Tools } from './z3-tools.mjs';
-import { registerSpecTools, execSpec } from './spec-tools.mjs';
+import { registerSpecTools } from './spec-tools.mjs';
+import { registerCrudTools } from './spec/crud/index.mjs';
+import { formatValidationResult } from './spec/utils/format.mjs';
+import { registerLspTools } from './lsp/index.mjs';
+import { registerDapTools } from './dap/index.mjs';
+import { registerRevTools } from './rev/index.mjs';
+import { parseSpecDir } from './spec/parse/html-parser.mjs';
+import { validateAll } from './spec/validate/index.mjs';
+import { validateLinks } from './spec/validate/links.mjs';
+import { trackStatus } from './spec/status/tracker.mjs';
+import { reportJson } from './spec/status/reporter.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -241,9 +250,12 @@ export function loadWorkerEnv() {
 
 const WORKER_TOOLS = [
   'Read', 'Glob', 'Grep', 'Bash', 'Edit',
-  'mcp__lsp-tools__lsp_hover', 'mcp__lsp-tools__lsp_references',
-  'mcp__lsp-tools__lsp_rename', 'mcp__lsp-tools__lsp_edit_references',
-  'mcp__lsp-tools__lsp_document_symbols', 'mcp__lsp-tools__lsp_implementations',
+  'mcp__arch__lsp_symbol_profile',
+  'mcp__arch__lsp_trace_origin',
+  'mcp__arch__lsp_code_action',
+  'mcp__arch__lsp_find_dead_code',
+  'mcp__arch__lsp_impact_analysis',
+  'mcp__arch__spec_lint',
 ];
 
 const WORKER_SYSTEM_FAST = `你是机械化任务执行器。
@@ -253,7 +265,7 @@ const WORKER_SYSTEM_FAST = `你是机械化任务执行器。
 
 const WORKER_SYSTEM_PRO = `你是高级任务执行器。
 - 读文件用 Read，编辑用 Edit，搜索用 Grep/Glob，命令用 Bash
-- 可用 LSP 工具做语义查询（hover/references/implementations/document_symbols）
+- 可用 LSP 工具做语义查询（lsp_symbol_profile/lsp_trace_origin/lsp_code_action）
 - 理解任务意图，选最优路径，遵循项目既有规范
 - 必要时用 WebSearch 查资料`;
 
@@ -322,24 +334,29 @@ async function runXfWithRetry(task, baseCwd, mode, upstreamResults, isDag, xfSee
   }
 }
 
-export function loadGlmEnv() {
+function loadProviderEnv(base, token) {
   return {
     ...process.env,
-    ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
-    ANTHROPIC_AUTH_TOKEN: '045d45580b6843f79e96d3db25664395.nA1ycK7CcQzFLaZT',
+    ANTHROPIC_BASE_URL: base,
+    ANTHROPIC_AUTH_TOKEN: token,
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
   };
 }
 
+function loadProviderEnvFromFile(providerName) {
+  return loadEnv(providerName);
+}
+
+export function loadGlmEnv() {
+  if (process.env.GLM_AUTH_TOKEN) return loadProviderEnv('https://open.bigmodel.cn/api/anthropic', process.env.GLM_AUTH_TOKEN);
+  return loadProviderEnvFromFile('glm');
+}
+
 export function loadXfEnv() {
-  return {
-    ...process.env,
-    ANTHROPIC_BASE_URL: 'https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic',
-    ANTHROPIC_AUTH_TOKEN: '98788837bdc2c296dca26b222ddf3160:ZTgxNmVkMTcyNjEwOGNmNTA5NDQ1YTcw',
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-    CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
-  };
+  if (process.env.XF_AUTH_TOKEN) return loadProviderEnv('https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic', process.env.XF_AUTH_TOKEN);
+  if (process.env.ANTHROPIC_AUTH_TOKEN && process.env.ANTHROPIC_BASE_URL?.includes('xf-yun')) return { ...process.env };
+  return loadProviderEnvFromFile('xf-astron');
 }
 
 const RESULT_JSON_INSTRUCTION = `
@@ -452,7 +469,7 @@ async function runWorkerTask(task, baseCwd, env, mode = 'fast', model = null, up
   const success = finalResult?.subtype === 'success';
   const raw = finalResult?.result || '(no output)';
   const { summary, output } = isDag ? extractResultJson(raw) : { summary: '', output: null };
-  return { id: task.id, success, result: raw.slice(0, 2000), summary, output };
+  return { id: task.id, success, result: raw, summary, output };
 }
 
 async function workerDispatch(args) {
@@ -630,36 +647,44 @@ async function workerDispatch(args) {
 }
 
 const LSP_TOOLS = [
-  'mcp__lsp-tools__lsp_hover', 'mcp__lsp-tools__lsp_references',
-  'mcp__lsp-tools__lsp_implementations', 'mcp__lsp-tools__lsp_type_definition',
-  'mcp__lsp-tools__lsp_document_symbols', 'mcp__lsp-tools__lsp_document_highlight',
-  'mcp__lsp-tools__lsp_folding_range', 'mcp__lsp-tools__lsp_diagnostic',
-  'mcp__lsp-tools__lsp_workspace_symbol', 'mcp__lsp-tools__lsp_trace_origin',
-  'mcp__lsp-tools__lsp_data_query', 'mcp__lsp-tools__lsp_rename',
-  'mcp__lsp-tools__lsp_edit_references', 'mcp__lsp-tools__lsp_apply_code_action',
-  'mcp__lsp-tools__lsp_organize_imports', 'mcp__lsp-tools__lsp_format',
-  'mcp__lsp-tools__lsp_add_import', 'mcp__lsp-tools__lsp_delete_symbol',
+  'mcp__arch__lsp_symbol_profile',
+  'mcp__arch__lsp_trace_origin',
+  'mcp__arch__lsp_find_dead_code',
+  'mcp__arch__lsp_data_query',
+  'mcp__arch__lsp_code_action',
+  'mcp__arch__lsp_safe_delete',
 ];
 
 const DAP_TOOLS = [
-  'mcp__dap-tools__dap_check_env', 'mcp__dap-tools__dap_launch',
-  'mcp__dap-tools__dap_attach', 'mcp__dap-tools__dap_set_breakpoint',
-  'mcp__dap-tools__dap_set_function_breakpoint', 'mcp__dap-tools__dap_continue',
-  'mcp__dap-tools__dap_step', 'mcp__dap-tools__dap_stack_trace',
-  'mcp__dap-tools__dap_variables', 'mcp__dap-tools__dap_evaluate',
-  'mcp__dap-tools__dap_disconnect', 'mcp__dap-tools__dap_elf_symbols',
-  'mcp__dap-tools__dap_dwarf_info', 'mcp__dap-tools__dap_disassemble',
+  'mcp__arch__dap_check_env',
+  'mcp__arch__dap_start_session',
+  'mcp__arch__dap_set_breakpoint',
+  'mcp__arch__dap_run_control',
+  'mcp__arch__dap_stack_trace',
+  'mcp__arch__dap_evaluate',
+  'mcp__arch__dap_analyze_binary',
+];
+
+const SPEC_TOOLS = [
+  'mcp__arch__spec_lint', 'mcp__arch__spec_status', 'mcp__arch__spec_migrate', 'mcp__arch__spec_audit',
+  'mcp__arch__spec_openapi', 'mcp__arch__spec_schema', 'mcp__arch__spec_crud',
+];
+
+const REV_TOOLS = [
+  'mcp__arch__rev_check_env', 'mcp__arch__rev_import_binary', 'mcp__arch__rev_decompile',
+  'mcp__arch__rev_list_functions', 'mcp__arch__rev_cross_references', 'mcp__arch__rev_search_strings',
+  'mcp__arch__rev_analyze_control_flow', 'mcp__arch__rev_symexec',
 ];
 
 const ALL_TOOLS = [
   'Read', 'Glob', 'Grep', 'Bash', 'WebSearch', 'WebFetch',
-  ...LSP_TOOLS, ...DAP_TOOLS,
+  ...LSP_TOOLS, ...DAP_TOOLS, ...SPEC_TOOLS, ...REV_TOOLS,
 ];
 
 const LSP_DAP_GUIDE = `
 工具使用铁律：
-- 分析代码必须用 LSP 工具：lsp_hover 查类型、lsp_references 查引用、lsp_trace_origin 追数据流、lsp_implementations 查实现、lsp_document_symbols 看文件结构。不要只用 Read/Grep。
-- 需要验证运行时行为时用 DAP 工具：dap_launch 启动程序、dap_set_breakpoint 下断点、dap_evaluate 查看变量值。
+- 分析代码必须用 LSP 工具：lsp_symbol_profile 查符号全貌、lsp_trace_origin 追数据流、lsp_impact_analysis 查影响范围、lsp_call_graph 查调用链、lsp_data_query 查配置。不要只用 Read/Grep。
+- 需要验证运行时行为时用 DAP 工具：dap_start_session 启动调试、dap_set_breakpoint 下断点、dap_evaluate 查看变量值、dap_inspect LSP+DAP融合诊断。
 - 上网搜索技术背景用 WebSearch 和 WebFetch。
 - 分析 SPEC 时先提取 REQ 清单和章节结构，不要逐行读文本。
 - 分析代码时先用 lsp_document_symbols 获取符号表，再按需深入。`;
@@ -825,16 +850,40 @@ export function registerTools(server, env) {
           if (dimensions?.length) userPrompt += `\n\n重点审计维度: ${dimensions.join('、')}`;
           // 自动前置：spec validate + links + status
           try {
-            const [validateResult, linksResult, statusResult] = await Promise.all([
-              execSpec(['validate', resolved]).catch(() => null),
-              execSpec(['links', resolved]).catch(() => null),
-              execSpec(['status', resolved]).catch(() => null),
-            ]);
+            const index = parseSpecDir(resolved);
+            const vResult = validateAll(index);
+            const lResult = validateLinks(index);
+            const sResult = trackStatus(index);
             const preAudit = [];
-            if (validateResult) preAudit.push(`\n\n--- 自动验证: SPEC VALIDATE ---\n${validateResult.content[0].text}`);
-            if (linksResult) preAudit.push(`\n\n--- 自动验证: SPEC LINKS ---\n${linksResult.content[0].text}`);
-            if (statusResult) preAudit.push(`\n\n--- 自动验证: REQ STATUS ---\n${statusResult.content[0].text}`);
-            if (preAudit.length) userPrompt += preAudit.join('');
+            preAudit.push(formatValidationResult('SPEC VALIDATE', vResult, '\n\n--- 自动验证: '));
+            preAudit.push(formatValidationResult('SPEC LINKS', lResult, '\n\n--- 自动验证: '));
+            preAudit.push(`\n\n--- 自动验证: REQ STATUS ---\n${reportJson(sResult)}`);
+            userPrompt += preAudit.join('');
+          } catch {}
+          // 自动前置：源码结构概览
+          try {
+            const SRC_DIRS = ['src', 'lib', 'pkg', 'app', 'cmd', 'internal', 'server', 'core', 'modules', 'packages', 'apps', 'services'];
+            const srcDir = SRC_DIRS.find(d => existsSync(join(resolved, d)));
+            if (srcDir) {
+              const srcPath = join(resolved, srcDir);
+              const entries = readdirSync(srcPath, { withFileTypes: true })
+                .filter(e => !e.name.startsWith('.') && !e.name.startsWith('__'))
+                .map(e => e.isDirectory() ? `${e.name}/` : e.name);
+              userPrompt += `\n\n--- 自动验证: SOURCE STRUCTURE ---\n${srcDir}/ → ${entries.join(', ')}`;
+              const LANG_MARKERS = [
+                ['tsconfig.json', 'TypeScript'], ['package.json', 'Node.js'], ['deno.json', 'Deno'],
+                ['bun.lockb', 'Bun'], ['Cargo.toml', 'Rust'], ['go.mod', 'Go'],
+                ['pyproject.toml', 'Python'], ['setup.py', 'Python'], ['Pipfile', 'Python'],
+                ['pom.xml', 'Java/Kotlin'], ['build.gradle', 'Java/Kotlin'], ['build.gradle.kts', 'Kotlin'],
+                ['CMakeLists.txt', 'C/C++'], ['Makefile', 'C/C++'], ['meson.build', 'C/C++'],
+                ['Gemfile', 'Ruby'], ['composer.json', 'PHP'], ['mix.exs', 'Elixir'],
+                ['Package.swift', 'Swift'], ['build.zig', 'Zig'], ['cabal.project', 'Haskell'],
+                ['pubspec.yaml', 'Dart/Flutter'], ['*.sln', '.NET'],
+              ];
+              const detected = LANG_MARKERS.filter(([f]) => existsSync(join(resolved, f))).map(([, lang]) => lang);
+              if (detected.length) userPrompt += `\nDetected: ${[...new Set(detected)].join(', ')}`;
+              userPrompt += '\nUse lsp_symbol_profile, lsp_dependency_graph, lsp_find_dead_code for deeper analysis';
+            }
           } catch {}
           break;
         }
@@ -918,6 +967,18 @@ export function registerTools(server, env) {
   // === Z3 SPEC Verification Tools ===
   registerZ3Tools(server);
 
-  // === Spec-Tools CLI（validate/links/status/graph/migrate） ===
+  // === Spec-Tools（validate/links/status/graph/migrate） ===
   registerSpecTools(server);
+
+  // === Spec CRUD（确定性 HTML 结构化元素读写） ===
+  registerCrudTools(server);
+
+  // === LSP Tools（symbol_profile/code_action/refactoring/graphs） ===
+  registerLspTools(server);
+
+  // === DAP Tools（debug sessions/breakpoints/evaluate） ===
+  registerDapTools(server);
+
+  // === Reverse Engineering Tools（decompile/disassemble/symexec） ===
+  registerRevTools(server);
 }

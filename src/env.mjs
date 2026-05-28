@@ -9,11 +9,11 @@ export function loadProvider(providerName = 'kocode') {
   } catch { return null; }
 }
 
-export function loadEnv() {
-  const provider = loadProvider(process.env.ARCHITECT_PROVIDER || 'kocode');
+export function loadEnv(providerName) {
+  const name = providerName || process.env.ARCHITECT_PROVIDER || 'deepseek';
+  const provider = loadProvider(name);
   const env = { ...process.env };
 
-  // 清理主 CC 特有配置
   delete env.CLAUDE_CODE_EFFORT_LEVEL;
   delete env.CLAUDE_CODE_FORCE_EFFORT;
 
